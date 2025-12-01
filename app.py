@@ -1,0 +1,204 @@
+import streamlit as st
+import pandas as pd
+import requests
+import yfinance as yf
+import numpy as np
+import os
+import logging
+import datetime as dt
+import pytz
+
+# --- CONFIGURAÇÃO DA PÁGINA STREAMLIT ---
+st.set_page_config(page_title="Monitor de Quedas BDRs", layout="wide")
+
+# --- FUNÇÃO PARA GERIR SEGREDOS (Compatível com Streamlit e OS/GitHub) ---
+def get_secret(key):
+    # Tenta pegar dos segredos do Streamlit
+    if hasattr(st, "secrets") and key in st.secrets:
+        return st.secrets[key]
+    # Tenta pegar das variáveis de ambiente (Local ou GitHub Actions)
+    return os.environ.get(key)
+
+# --- CONFIGURAÇÕES ---
+WHATSAPP_PHONE = get_secret('WHATSAPP_PHONE')
+WHATSAPP_APIKEY = get_secret('WHATSAPP_APIKEY')
+BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
+
+PERIODO_HISTORICO_DIAS = "60d"
+TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
+LIMITE_QUEDA_PERCENTUAL = -0.05
+
+# --- FUNÇÕES DE LÓGICA (COM CACHE DO STREAMLIT) ---
+
+@st.cache_data(ttl=3600) # Cache de 1 hora para não ficar lento
+def obter_lista_bdrs_da_brapi():
+    if not BRAPI_API_TOKEN:
+        st.error("BRAPI_API_TOKEN não configurado.")
+        return []
+    try:
+        url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
+        response = requests.get(url, timeout=30)
+        dados = response.json().get('stocks', [])
+        df = pd.DataFrame(dados)
+        bdrs = df[df['stock'].str.endswith(TERMINACOES_BDR, na=False)]['stock'].tolist()
+        return bdrs
+    except Exception as e:
+        st.error(f"Erro ao buscar lista de BDRs: {e}")
+        return []
+
+def buscar_dados_historicos_completos(tickers, periodo):
+    tickers_sa = [f"{ticker}.SA" for ticker in tickers]
+    try:
+        # st.spinner mostra um ícone de carregamento na tela
+        with st.spinner(f'Baixando dados de {len(tickers)} ativos...'):
+            dados = yf.download(tickers_sa, period=periodo, auto_adjust=True, progress=False, ignore_tz=True)
+        
+        if dados.empty: return pd.DataFrame()
+
+        # Ajuste de MultiIndex (igual ao código original)
+        if isinstance(dados.columns, pd.MultiIndex):
+             dados.columns = pd.MultiIndex.from_tuples([(col[0], col[1].replace(".SA", "")) for col in dados.columns])
+        elif isinstance(dados.index, pd.DatetimeIndex) and len(tickers) == 1:
+             ticker_name = tickers[0]
+             dados.columns = pd.MultiIndex.from_product([dados.columns, [ticker_name]])
+        
+        dados = dados.dropna(axis=1, how='all')
+        return dados
+    except Exception as e:
+        st.error(f"Erro ao buscar dados históricos: {e}")
+        return pd.DataFrame()
+
+def calcular_indicadores(df):
+    df_completo = df.copy()
+    tickers = df.columns.get_level_values(1).unique()
+    dict_indicadores = {}
+
+    for ticker in tickers:
+        try:
+            close_df = df[('Close', ticker)]
+            volume_df = df[('Volume', ticker)]
+            
+            # IFR14
+            delta = close_df.diff()
+            ganhos = delta.where(delta > 0, 0).ewm(com=14 - 1, adjust=False).mean()
+            perdas = -delta.where(delta < 0, 0).ewm(com=14 - 1, adjust=False).mean()
+            rs = ganhos / perdas
+            ifr14 = 100 - (100 / (1 + rs))
+            dict_indicadores[('IFR14', ticker)] = ifr14.replace([np.inf, -np.inf], 100).fillna(50)
+
+            # Volume Médio 10 e Variação
+            dict_indicadores[('VolumeMedio10', ticker)] = volume_df.rolling(window=10).mean()
+            dict_indicadores[('Variacao%', ticker)] = close_df.pct_change()
+
+            # Bandas de Bollinger
+            sma_20 = close_df.rolling(window=20).mean()
+            std_20 = close_df.rolling(window=20).std()
+            dict_indicadores[('BandaSuperior', ticker)] = sma_20 + (std_20 * 2)
+            dict_indicadores[('BandaInferior', ticker)] = sma_20 - (std_20 * 2)
+
+        except Exception:
+            continue
+
+    if not dict_indicadores: return pd.DataFrame()
+    
+    df_indicadores = pd.DataFrame(dict_indicadores)
+    df_completo = df_completo.join(df_indicadores, how='left')
+    return df_completo.sort_index(axis=1)
+
+def avaliar_sinal_queda(ultimo_candle, ticker):
+    try:
+        has_volume = ('Volume', ticker) in ultimo_candle and ('VolumeMedio10', ticker) in ultimo_candle
+        has_ifr = ('IFR14', ticker) in ultimo_candle
+
+        volume_alto = has_volume and not pd.isna(ultimo_candle[('VolumeMedio10', ticker)]) and ultimo_candle[('Volume', ticker)] > ultimo_candle[('VolumeMedio10', ticker)]
+        em_sobrevenda = has_ifr and ultimo_candle[('IFR14', ticker)] < 30
+        
+        if volume_alto and em_sobrevenda:
+            return "★★★ Sinal Forte"
+        elif volume_alto or em_sobrevenda:
+            return "★★☆ Sinal Bom"
+        else:
+            return "★☆☆ Sinal de Atenção"
+    except:
+         return "☆☆☆ Erro"
+
+def enviar_whatsapp(msg):
+    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
+        st.warning("Credenciais WhatsApp não configuradas. Mensagem não enviada.")
+        return
+    try:
+        texto_codificado = requests.utils.quote(msg)
+        url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
+        requests.get(url, timeout=20)
+        st.success("Notificação enviada para o WhatsApp!")
+    except Exception as e: 
+        st.error(f"Erro ao enviar WhatsApp: {e}")
+
+# --- INTERFACE PRINCIPAL ---
+
+st.title("📉 Monitor de Quedas BDRs")
+st.markdown("Este painel analisa BDRs em queda forte, abaixo das Bandas de Bollinger e com indicadores de sobrevenda.")
+
+# Botão para iniciar a análise manualmente
+if st.button("🔄 Rodar Análise Agora") or os.environ.get("GITHUB_ACTIONS") == "true":
+    
+    # 1. Obter BDRs
+    bdrs = obter_lista_bdrs_da_brapi()
+    st.write(f"🔍 **Total de BDRs encontrados:** {len(bdrs)}")
+    
+    if len(bdrs) > 0:
+        # 2. Baixar Dados
+        dados = buscar_dados_historicos_completos(bdrs, PERIODO_HISTORICO_DIAS)
+        
+        if not dados.empty:
+            # 3. Calcular Indicadores
+            df_calc = calcular_indicadores(dados)
+            
+            # 4. Filtrar Quedas
+            ultimo_dia = df_calc.iloc[-1]
+            variacoes = ultimo_dia['Variacao%']
+            quedas = variacoes[variacoes <= LIMITE_QUEDA_PERCENTUAL]
+            
+            sinais_finais = []
+            
+            for ticker in quedas.index:
+                # Filtro Bollinger
+                low = ultimo_dia[('Low', ticker)]
+                b_inf = ultimo_dia[('BandaInferior', ticker)]
+                
+                if not pd.isna(low) and not pd.isna(b_inf) and low < b_inf:
+                    rating = avaliar_sinal_queda(ultimo_dia, ticker)
+                    var_val = ultimo_dia[('Variacao%', ticker)]
+                    ifr_val = ultimo_dia[('IFR14', ticker)]
+                    
+                    sinais_finais.append({
+                        'Ticker': ticker,
+                        'Variação': f"{var_val:.2%}",
+                        'IFR14': f"{ifr_val:.1f}",
+                        'Classificação': rating,
+                        'Preço Fecho': f"R$ {ultimo_dia[('Close', ticker)]:.2f}"
+                    })
+
+            # 5. Exibir Resultados
+            if sinais_finais:
+                df_resultado = pd.DataFrame(sinais_finais)
+                st.subheader("🚨 Oportunidades Identificadas")
+                st.dataframe(df_resultado, use_container_width=True)
+                
+                # Montar mensagem para WhatsApp
+                fuso = pytz.timezone('America/Sao_Paulo')
+                agora = dt.datetime.now(fuso).strftime("%d/%m %H:%M")
+                
+                msg = f"🚨 *Robô Quedas BDRs* ({agora})\n\n"
+                for item in sinais_finais:
+                    msg += f"-> *{item['Ticker']}*: {item['Variação']} | {item['Classificação']}\n"
+                msg += "\nVer detalhes no WebApp."
+                
+                # Enviar mensagem (se configurado checkbox ou for automação)
+                enviar = st.checkbox("Enviar notificação WhatsApp?", value=True)
+                if enviar:
+                    enviar_whatsapp(msg)
+            else:
+                st.info("Nenhuma oportunidade de reversão encontrada hoje.")
+        else:
+            st.warning("Não foi possível obter dados históricos.")
