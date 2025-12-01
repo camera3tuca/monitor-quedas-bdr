@@ -1,0 +1,31 @@
+name: Monitor de Quedas Diário
+
+on:
+  schedule:
+    # Roda de segunda a sexta às 17:00 UTC (14:00 Brasília aprox)
+    - cron: '0 17 * * 1-5'
+  workflow_dispatch: # Permite rodar manualmente pelo GitHub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+      WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
+      BRAPI_API_TOKEN: ${{ secrets.BRAPI_API_TOKEN }}
+      GITHUB_ACTIONS: "true" # Flag para o script saber que é automação
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar Monitor
+        run: python app.py
