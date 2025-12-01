@@ -4,33 +4,46 @@ import requests
 import yfinance as yf
 import numpy as np
 import os
-import logging
 import datetime as dt
 import pytz
 
 # --- CONFIGURAÇÃO DA PÁGINA STREAMLIT ---
 st.set_page_config(page_title="Monitor de Quedas BDRs", layout="wide")
 
-# --- FUNÇÃO PARA GERIR SEGREDOS (Compatível com Streamlit e OS/GitHub) ---
+# --- FUNÇÃO PARA GERIR SEGREDOS ---
 def get_secret(key):
-    # Tenta pegar dos segredos do Streamlit
     if hasattr(st, "secrets") and key in st.secrets:
         return st.secrets[key]
-    # Tenta pegar das variáveis de ambiente (Local ou GitHub Actions)
     return os.environ.get(key)
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES LATERAIS (SIDEBAR) ---
+st.sidebar.header("🎛️ Configurações do Filtro")
+
+# Slider para definir a queda mínima (Padrão: -3%)
+FILTRO_QUEDA = st.sidebar.slider(
+    "Mínimo de Queda (%)", 
+    min_value=-15, 
+    max_value=0, 
+    value=-3,  # Agora o padrão é 3% (mais sensível)
+    step=1
+) / 100
+
+# Opção para ignorar filtro de Bollinger (para ver tudo o que cai)
+USAR_BOLLINGER = st.sidebar.checkbox("Exigir estar abaixo da Banda de Bollinger?", value=True)
+
+st.sidebar.info(f"Procurando ativos com queda maior que {FILTRO_QUEDA:.0%}...")
+
+# --- CREDENCIAIS ---
 WHATSAPP_PHONE = get_secret('WHATSAPP_PHONE')
 WHATSAPP_APIKEY = get_secret('WHATSAPP_APIKEY')
 BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 
 PERIODO_HISTORICO_DIAS = "60d"
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
-LIMITE_QUEDA_PERCENTUAL = -0.05
 
-# --- FUNÇÕES DE LÓGICA (COM CACHE DO STREAMLIT) ---
+# --- FUNÇÕES DE LÓGICA ---
 
-@st.cache_data(ttl=3600) # Cache de 1 hora para não ficar lento
+@st.cache_data(ttl=3600)
 def obter_lista_bdrs_da_brapi():
     if not BRAPI_API_TOKEN:
         st.error("BRAPI_API_TOKEN não configurado.")
@@ -49,13 +62,11 @@ def obter_lista_bdrs_da_brapi():
 def buscar_dados_historicos_completos(tickers, periodo):
     tickers_sa = [f"{ticker}.SA" for ticker in tickers]
     try:
-        # st.spinner mostra um ícone de carregamento na tela
         with st.spinner(f'Baixando dados de {len(tickers)} ativos...'):
             dados = yf.download(tickers_sa, period=periodo, auto_adjust=True, progress=False, ignore_tz=True)
         
         if dados.empty: return pd.DataFrame()
 
-        # Ajuste de MultiIndex (igual ao código original)
         if isinstance(dados.columns, pd.MultiIndex):
              dados.columns = pd.MultiIndex.from_tuples([(col[0], col[1].replace(".SA", "")) for col in dados.columns])
         elif isinstance(dados.index, pd.DatetimeIndex) and len(tickers) == 1:
@@ -124,7 +135,7 @@ def avaliar_sinal_queda(ultimo_candle, ticker):
 
 def enviar_whatsapp(msg):
     if not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
-        st.warning("Credenciais WhatsApp não configuradas. Mensagem não enviada.")
+        st.warning("Credenciais WhatsApp não configuradas.")
         return
     try:
         texto_codificado = requests.utils.quote(msg)
@@ -137,68 +148,77 @@ def enviar_whatsapp(msg):
 # --- INTERFACE PRINCIPAL ---
 
 st.title("📉 Monitor de Quedas BDRs")
-st.markdown("Este painel analisa BDRs em queda forte, abaixo das Bandas de Bollinger e com indicadores de sobrevenda.")
+st.markdown(f"**Filtro Atual:** Queda de {FILTRO_QUEDA:.0%} | Bollinger: {'Sim' if USAR_BOLLINGER else 'Não'}")
 
-# Botão para iniciar a análise manualmente
 if st.button("🔄 Rodar Análise Agora") or os.environ.get("GITHUB_ACTIONS") == "true":
     
-    # 1. Obter BDRs
     bdrs = obter_lista_bdrs_da_brapi()
     st.write(f"🔍 **Total de BDRs encontrados:** {len(bdrs)}")
     
     if len(bdrs) > 0:
-        # 2. Baixar Dados
         dados = buscar_dados_historicos_completos(bdrs, PERIODO_HISTORICO_DIAS)
         
         if not dados.empty:
-            # 3. Calcular Indicadores
             df_calc = calcular_indicadores(dados)
-            
-            # 4. Filtrar Quedas
             ultimo_dia = df_calc.iloc[-1]
             variacoes = ultimo_dia['Variacao%']
-            quedas = variacoes[variacoes <= LIMITE_QUEDA_PERCENTUAL]
+            
+            # Filtro 1: Percentual de Queda (Controlado pelo Slider)
+            quedas = variacoes[variacoes <= FILTRO_QUEDA]
             
             sinais_finais = []
             
             for ticker in quedas.index:
-                # Filtro Bollinger
+                # Filtro 2: Bandas de Bollinger (Opcional via Checkbox)
                 low = ultimo_dia[('Low', ticker)]
                 b_inf = ultimo_dia[('BandaInferior', ticker)]
                 
+                passou_bollinger = False
                 if not pd.isna(low) and not pd.isna(b_inf) and low < b_inf:
+                    passou_bollinger = True
+                
+                # Só adiciona se o filtro Bollinger estiver desligado OU se passou no filtro
+                if not USAR_BOLLINGER or passou_bollinger:
                     rating = avaliar_sinal_queda(ultimo_dia, ticker)
                     var_val = ultimo_dia[('Variacao%', ticker)]
                     ifr_val = ultimo_dia[('IFR14', ticker)]
+                    close_val = ultimo_dia[('Close', ticker)]
                     
                     sinais_finais.append({
                         'Ticker': ticker,
                         'Variação': f"{var_val:.2%}",
                         'IFR14': f"{ifr_val:.1f}",
                         'Classificação': rating,
-                        'Preço Fecho': f"R$ {ultimo_dia[('Close', ticker)]:.2f}"
+                        'Preço Fecho': f"R$ {close_val:.2f}" if not pd.isna(close_val) else "N/A"
                     })
 
-            # 5. Exibir Resultados
             if sinais_finais:
+                # Ordenar: Fortes primeiro
+                sinais_finais.sort(key=lambda x: x['Classificação'], reverse=True)
+                
                 df_resultado = pd.DataFrame(sinais_finais)
-                st.subheader("🚨 Oportunidades Identificadas")
+                st.subheader(f"🚨 {len(sinais_finais)} Oportunidades Encontradas")
                 st.dataframe(df_resultado, use_container_width=True)
                 
-                # Montar mensagem para WhatsApp
                 fuso = pytz.timezone('America/Sao_Paulo')
                 agora = dt.datetime.now(fuso).strftime("%d/%m %H:%M")
                 
-                msg = f"🚨 *Robô Quedas BDRs* ({agora})\n\n"
-                for item in sinais_finais:
+                msg = f"🚨 *Robô BDRs* ({agora})\nFiltro: {FILTRO_QUEDA:.0%}\n\n"
+                for item in sinais_finais[:10]: # Limita a 10 no Whatsapp para não ficar gigante
                     msg += f"-> *{item['Ticker']}*: {item['Variação']} | {item['Classificação']}\n"
+                
+                if len(sinais_finais) > 10:
+                    msg += f"\n...e mais {len(sinais_finais)-10} no App."
+                
                 msg += "\nVer detalhes no WebApp."
                 
-                # Enviar mensagem (se configurado checkbox ou for automação)
-                enviar = st.checkbox("Enviar notificação WhatsApp?", value=True)
+                # Envio automático só no GitHub Actions ou se marcado
+                is_github = os.environ.get("GITHUB_ACTIONS") == "true"
+                enviar = st.checkbox("Enviar notificação WhatsApp?", value=is_github)
+                
                 if enviar:
                     enviar_whatsapp(msg)
             else:
-                st.info("Nenhuma oportunidade de reversão encontrada hoje.")
+                st.info("Nenhum ativo corresponde aos filtros atuais. Tente diminuir a % de queda na barra lateral.")
         else:
             st.warning("Não foi possível obter dados históricos.")
