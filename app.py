@@ -16,10 +16,24 @@ def get_secret(key):
         return st.secrets[key]
     return os.environ.get(key)
 
-# --- SIDEBAR (FILTROS) ---
-st.sidebar.header("🎛️ Configurações")
-FILTRO_QUEDA = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
-USAR_BOLLINGER = st.sidebar.checkbox("Exigir estar abaixo da Banda?", value=True)
+# --- CONFIGURAÇÃO DA BARRA LATERAL (VISUAL - USUÁRIO) ---
+st.sidebar.header("🎛️ Configurações (Site)")
+
+# Estes são os controlos que tu vês no tablet (Versão 3.0)
+filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
+bollinger_visual = st.sidebar.checkbox("Exigir estar abaixo da Banda?", value=True)
+
+# --- LÓGICA DE DECISÃO (CÉREBRO) ---
+# Se for o ROBÔ rodando no GitHub -> Usa regras fixas (-1%, Top 10, Sem Bollinger)
+# Se for TU no site -> Usa o que escolheste na barra lateral
+if os.environ.get("GITHUB_ACTIONS") == "true":
+    FILTRO_QUEDA = -0.01  # -1% (Regra do Robô)
+    USAR_BOLLINGER = False # Robô quer ver tudo
+    MODO_ROBO = True
+else:
+    FILTRO_QUEDA = filtro_visual
+    USAR_BOLLINGER = bollinger_visual
+    MODO_ROBO = False
 
 # --- CREDENCIAIS ---
 WHATSAPP_PHONE = get_secret('WHATSAPP_PHONE')
@@ -53,7 +67,6 @@ def buscar_dados(tickers):
             df = yf.download(sa_tickers, period=PERIODO_HISTORICO_DIAS, auto_adjust=True, progress=False, ignore_tz=True)
         if df.empty: return pd.DataFrame()
         
-        # Ajuste de colunas (MultiIndex)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = pd.MultiIndex.from_tuples([(c[0], c[1].replace(".SA", "")) for c in df.columns])
         elif isinstance(df.index, pd.DatetimeIndex) and len(tickers) == 1:
@@ -96,7 +109,6 @@ def calcular_indicadores(df):
     return df.join(df_inds, how='left').sort_index(axis=1)
 
 def analisar_sinal(row, t):
-    # Retorna: (Texto, Motivo, Score Numérico para ordenar)
     try:
         vol = row[('Volume', t)]
         vol_med = row[('VolMedio', t)]
@@ -106,30 +118,35 @@ def analisar_sinal(row, t):
         tem_ifr = ifr < 30 if not pd.isna(ifr) else False
         
         if tem_vol and tem_ifr:
-            return "★★★ Forte", "Volume Alto + IFR < 30", 3
+            return "★★★ Forte", "Volume Explosivo + IFR Baixo", 3
         elif tem_vol:
             return "★★☆ Médio", "Volume Alto", 2
         elif tem_ifr:
-            return "★★☆ Médio", "IFR < 30 (Sobrevenda)", 2
+            return "★★☆ Médio", "IFR Baixo (Sobrevenda)", 2
         else:
-            return "★☆☆ Atenção", "Apenas Queda (Bandas)", 1
+            return "★☆☆ Atenção", "Apenas Queda", 1
     except:
         return "Erro", "-", 0
+
+def enviar_whatsapp(msg):
+    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY: return
+    try:
+        texto_codificado = requests.utils.quote(msg)
+        url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
+        requests.get(url, timeout=20)
+    except: pass
 
 # --- APP VISUAL ---
 st.title("📉 Monitor Inteligente de BDRs")
 
-# Legenda Explicativa
-with st.expander("ℹ️ Entenda a Classificação (Critérios)"):
-    st.markdown("""
-    * **★★★ Forte:** A ação caiu, furou a banda de Bollinger, o **Volume explodiu** (pânico) e o **IFR está abaixo de 30** (muito barato). É o cenário ideal de reversão.
-    * **★★☆ Médio:** A ação caiu e tem **ou** Volume alto **ou** IFR baixo. É um sinal bom, mas falta um dos confirmadores.
-    * **★☆☆ Atenção:** A ação caiu abaixo da banda de Bollinger, mas sem volume expressivo ou IFR extremo. Pode continuar caindo (faca caindo).
-    """)
+# Mostra status
+if MODO_ROBO:
+    st.info(f"🤖 MODO ROBÔ: Buscando Top 10 Maiores Quedas (Min -1%)")
+else:
+    st.info(f"👤 MODO VISUAL: Filtro {FILTRO_QUEDA:.1%} | Bollinger {'Ligado' if USAR_BOLLINGER else 'Desligado'}")
 
-if st.button("🔄 Analisar Mercado") or os.environ.get("GITHUB_ACTIONS") == "true":
+if st.button("🔄 Analisar Mercado") or MODO_ROBO:
     bdrs = obter_lista_bdrs_da_brapi()
-    st.write(f"🔍 {len(bdrs)} BDRs na lista. Baixando dados...")
     
     if bdrs:
         df = buscar_dados(bdrs)
@@ -139,23 +156,24 @@ if st.button("🔄 Analisar Mercado") or os.environ.get("GITHUB_ACTIONS") == "tr
             
             resultados = []
             
-            # Loop nos ativos
             for t in df_calc.columns.get_level_values(1).unique():
                 try:
                     var = last.get(('Variacao', t), np.nan)
                     low = last.get(('Low', t), np.nan)
                     banda = last.get(('BandaInf', t), np.nan)
                     
-                    # Filtros principais
+                    # 1. Filtro de Queda
                     if pd.isna(var) or var > FILTRO_QUEDA: continue
-                    if USAR_BOLLINGER and (pd.isna(low) or low >= banda): continue
                     
-                    # Análise detalhada
+                    # 2. Filtro de Bollinger (Depende do modo)
+                    if USAR_BOLLINGER:
+                         if pd.isna(low) or low >= banda: continue
+                    
                     classif, motivo, score = analisar_sinal(last, t)
                     
                     resultados.append({
                         'Ticker': t,
-                        'Variação': var, # Mantém numérico para ordenar
+                        'Variação': var,
                         'Preço': last[('Close', t)],
                         'IFR14': last[('IFR14', t)],
                         'Classificação': classif,
@@ -165,45 +183,44 @@ if st.button("🔄 Analisar Mercado") or os.environ.get("GITHUB_ACTIONS") == "tr
                 except: continue
 
             if resultados:
-                # ORDENAÇÃO DUPLA: 
-                # 1º Pelo Score (3 estrelas primeiro)
-                # 2º Pelo tamanho da queda (maior queda primeiro, ou seja, menor número negativo)
-                
-                # Primeiro ordenamos pela variação (ascendente: -10% vem antes de -5%)
+                # ORDENAÇÃO: Sempre pela maior queda (número mais negativo primeiro)
                 resultados.sort(key=lambda x: x['Variação'])
-                # Depois ordenamos pelo Score (descendente: 3 antes de 1). 
-                # O Python mantém a ordem anterior dentro dos grupos (Estabilidade).
-                resultados.sort(key=lambda x: x['Score'], reverse=True)
                 
-                # Preparar para exibir (Formatar números)
+                # Exibição Visual (Tabela Bonita)
                 df_show = pd.DataFrame(resultados)
-                # Guardar valores originais para envio e formatar para tela
                 df_tela = df_show.copy()
                 df_tela['Variação'] = df_tela['Variação'].apply(lambda x: f"{x:.2%}")
                 df_tela['Preço'] = df_tela['Preço'].apply(lambda x: f"R$ {x:.2f}")
                 df_tela['IFR14'] = df_tela['IFR14'].apply(lambda x: f"{x:.1f}")
                 
-                # Remove colunas técnicas da tela
-                st.subheader(f"🚨 {len(resultados)} Oportunidades")
+                st.subheader(f"🚨 {len(resultados)} Oportunidades Encontradas")
                 st.dataframe(
                     df_tela[['Ticker', 'Variação', 'Classificação', 'Motivo', 'Preço', 'IFR14']], 
                     use_container_width=True,
                     hide_index=True
                 )
                 
-                # WhatsApp
-                fuso = pytz.timezone('America/Sao_Paulo')
-                hora = dt.datetime.now(fuso).strftime("%H:%M")
-                msg = f"🚨 *Robô BDRs* ({hora})\n\n"
-                
-                for item in resultados[:10]:
-                    icone = "🔥" if item['Score'] == 3 else "⚠️"
-                    msg += f"{icone} *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n   ↳ {item['Motivo']}\n"
-                
-                msg += f"\nLink: https://share.streamlit.io"
-                
-                check = st.checkbox("Enviar WhatsApp?", value=(os.environ.get("GITHUB_ACTIONS") == "true"))
-                if check: enviar_whatsapp(msg)
+                # ENVIO WHATSAPP (Lógica do Robô: Top 10 Maiores Quedas)
+                if MODO_ROBO:
+                    fuso = pytz.timezone('America/Sao_Paulo')
+                    hora = dt.datetime.now(fuso).strftime("%H:%M")
+                    
+                    msg = f"🚨 *Monitor Top 10 Quedas* ({hora})\nCritério: Queda > 1% (Sem Bollinger)\n\n"
+                    
+                    # Pega apenas os 10 primeiros (que já ordenamos pela maior queda)
+                    top_10 = resultados[:10]
+                    
+                    for item in top_10:
+                        # Icone muda conforme a força, mas a ordem é pela queda
+                        icone = "🔥" if item['Score'] == 3 else "🔻"
+                        msg += f"{icone} *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
+                    
+                    if len(resultados) > 10:
+                        msg += f"\n...e mais {len(resultados)-10} no site."
+                    
+                    msg += f"\nLink: https://share.streamlit.io"
+                    enviar_whatsapp(msg)
+                    st.success("Relatório Top 10 enviado para o WhatsApp!")
                 
             else:
                 st.info("Nenhuma oportunidade com os filtros atuais.")
