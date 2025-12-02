@@ -11,7 +11,6 @@ import pytz
 st.set_page_config(page_title="Monitor de Quedas BDRs", layout="wide")
 
 # --- FUNÇÃO DE SEGREDOS (VERSÃO ROBUSTA) ---
-# Esta função evita o erro "Exit code 1" no GitHub
 def get_secret(key):
     # 1. Tenta pegar das variáveis de ambiente (GitHub Actions)
     env_var = os.environ.get(key)
@@ -28,7 +27,6 @@ def get_secret(key):
     return None
 
 # --- LÓGICA DE MODO (HUMANO vs ROBÔ) ---
-# Se estiver rodando no GitHub Actions, ativa o modo Robô
 if os.environ.get("GITHUB_ACTIONS") == "true":
     MODO_ROBO = True
 else:
@@ -162,8 +160,13 @@ def enviar_whatsapp(msg):
         texto_codificado = requests.utils.quote(msg)
         url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
         
-        # Timeout curto para não travar o robô
-        response = requests.get(url, timeout=25)
+        # --- CORREÇÃO DO ERRO 403 ---
+        # Fingimos ser um navegador Chrome para a API aceitar
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=25)
         
         if response.status_code == 200:
             print("SUCESSO: Mensagem enviada para a API CallMeBot.")
@@ -240,7 +243,6 @@ if st.button("🔄 Analisar Mercado") or MODO_ROBO:
                     )
 
                 # Envio WhatsApp (Apenas Robô ou Checkbox Manual)
-                # No modo Robô, envia automático
                 if MODO_ROBO:
                     print(f"Encontradas {len(resultados)} oportunidades. Preparando mensagem...")
                     fuso = pytz.timezone('America/Sao_Paulo')
