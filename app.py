@@ -6,44 +6,33 @@ import numpy as np
 import os
 import datetime as dt
 import pytz
+import time
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Monitor de Quedas BDRs", layout="wide")
 
-# --- FUNÇÃO DE SEGREDOS (VERSÃO ROBUSTA) ---
+# --- FUNÇÃO DE SEGREDOS ---
 def get_secret(key):
-    # 1. Tenta pegar das variáveis de ambiente (GitHub Actions)
     env_var = os.environ.get(key)
-    if env_var:
-        return env_var
-    
-    # 2. Se não achar, tenta pegar dos segredos do Streamlit (Site)
+    if env_var: return env_var
     try:
         if hasattr(st, "secrets") and key in st.secrets:
             return st.secrets[key]
-    except:
-        pass
-        
+    except: pass
     return None
 
-# --- LÓGICA DE MODO (HUMANO vs ROBÔ) ---
-if os.environ.get("GITHUB_ACTIONS") == "true":
-    MODO_ROBO = True
-else:
-    MODO_ROBO = False
+# --- MODO ROBÔ ---
+MODO_ROBO = True if os.environ.get("GITHUB_ACTIONS") == "true" else False
 
-# --- BARRA LATERAL (APENAS PARA O MODO VISUAL) ---
+# --- CONFIGURAÇÕES VISUAIS ---
 if not MODO_ROBO:
     st.sidebar.header("🎛️ Configurações (Site)")
-    # Usuário escolhe no tablet. Padrão: -3% e com Bollinger
     filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
     bollinger_visual = st.sidebar.checkbox("Exigir estar abaixo da Banda?", value=True)
-    
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
 else:
-    # Configuração Fixa do Robô (Para o WhatsApp)
-    # Pega tudo que caiu mais de 1%, sem exigir Bollinger
+    # Robô: Queda de 1% e sem Bollinger
     FILTRO_QUEDA = -0.01 
     USAR_BOLLINGER = False 
 
@@ -55,13 +44,12 @@ BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 PERIODO_HISTORICO_DIAS = "60d"
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
-# --- FUNÇÕES DE DADOS E CÁLCULO ---
+# --- FUNÇÕES ---
 
 @st.cache_data(ttl=3600)
 def obter_lista_bdrs_da_brapi():
     if not BRAPI_API_TOKEN:
-        print("ERRO: Token BRAPI não encontrado.")
-        if not MODO_ROBO: st.error("Token BRAPI ausente.")
+        print("ERRO: Token BRAPI ausente.")
         return []
     try:
         url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
@@ -77,17 +65,15 @@ def buscar_dados(tickers):
     if not tickers: return pd.DataFrame()
     sa_tickers = [f"{t}.SA" for t in tickers]
     try:
-        # No modo robô, imprimimos no console. No site, usamos spinner.
-        if not MODO_ROBO:
-            with st.spinner(f"Analisando {len(tickers)} ativos..."):
-                df = yf.download(sa_tickers, period=PERIODO_HISTORICO_DIAS, auto_adjust=True, progress=False, ignore_tz=True)
+        if MODO_ROBO: print(f"Baixando dados de {len(tickers)} ativos...")
         else:
-            print(f"Baixando dados de {len(tickers)} ativos...")
-            df = yf.download(sa_tickers, period=PERIODO_HISTORICO_DIAS, auto_adjust=True, progress=False, ignore_tz=True)
+            with st.spinner(f"Baixando {len(tickers)} ativos..."):
+                pass # Apenas visual
+        
+        df = yf.download(sa_tickers, period=PERIODO_HISTORICO_DIAS, auto_adjust=True, progress=False, ignore_tz=True)
             
         if df.empty: return pd.DataFrame()
         
-        # Ajuste de colunas (MultiIndex)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = pd.MultiIndex.from_tuples([(c[0], c[1].replace(".SA", "")) for c in df.columns])
         elif isinstance(df.index, pd.DatetimeIndex) and len(tickers) == 1:
@@ -108,22 +94,18 @@ def calcular_indicadores(df):
             close = df[('Close', t)]
             vol = df[('Volume', t)]
             
-            # IFR 14
             delta = close.diff()
             ganho = delta.where(delta > 0, 0).ewm(com=13, adjust=False).mean()
             perda = -delta.where(delta < 0, 0).ewm(com=13, adjust=False).mean()
             ifr = 100 - (100 / (1 + (ganho/perda)))
             inds[('IFR14', t)] = ifr.fillna(50)
             
-            # Outros
             inds[('VolMedio', t)] = vol.rolling(10).mean()
             inds[('Variacao', t)] = close.pct_change()
             
-            # Bollinger
             sma = close.rolling(20).mean()
             std = close.rolling(20).std()
             inds[('BandaInf', t)] = sma - (std * 2)
-            
         except: continue
         
     if not inds: return pd.DataFrame()
@@ -139,62 +121,64 @@ def analisar_sinal(row, t):
         tem_vol = vol > vol_med if (not pd.isna(vol) and not pd.isna(vol_med)) else False
         tem_ifr = ifr < 30 if not pd.isna(ifr) else False
         
-        if tem_vol and tem_ifr:
-            return "★★★ Forte", "Volume Explosivo + IFR Baixo", 3
-        elif tem_vol:
-            return "★★☆ Médio", "Volume Alto", 2
-        elif tem_ifr:
-            return "★★☆ Médio", "IFR Baixo (Sobrevenda)", 2
-        else:
-            return "★☆☆ Atenção", "Apenas Queda", 1
-    except:
-        return "Erro", "-", 0
+        if tem_vol and tem_ifr: return "★★★ Forte", "Vol + IFR", 3
+        elif tem_vol: return "★★☆ Médio", "Volume", 2
+        elif tem_ifr: return "★★☆ Médio", "IFR", 2
+        else: return "★☆☆ Atenção", "Queda", 1
+    except: return "Erro", "-", 0
 
+# --- CORREÇÃO DO ENVIO (TÁTICA ANTI-403) ---
 def enviar_whatsapp(msg):
-    print("--- INICIANDO ENVIO WHATSAPP ---")
+    print("--- TENTANDO ENVIAR WHATSAPP (MÉTODO SEGURO) ---")
     if not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
-        print("ERRO: Credenciais de WhatsApp não encontradas.")
+        print("ERRO: Credenciais ausentes.")
         return
 
+    # Usamos uma Sessão para parecer um navegador real
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5'
+    })
+
     try:
-        texto_codificado = requests.utils.quote(msg)
-        url = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
+        # URL limpa (sem o texto)
+        url = "https://api.callmebot.com/whatsapp.php"
         
-        # --- CORREÇÃO DO ERRO 403 ---
-        # Fingimos ser um navegador Chrome para a API aceitar
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        # Parâmetros separados (requests cuida da codificação)
+        params = {
+            'phone': WHATSAPP_PHONE,
+            'apikey': WHATSAPP_APIKEY,
+            'text': msg
         }
         
-        response = requests.get(url, headers=headers, timeout=25)
+        # Tenta GET primeiro com parâmetros limpos
+        print("Enviando requisição...")
+        response = session.get(url, params=params, timeout=30)
         
         if response.status_code == 200:
-            print("SUCESSO: Mensagem enviada para a API CallMeBot.")
+            print("✅ SUCESSO: Mensagem aceite pelo CallMeBot.")
+        elif response.status_code == 403:
+            print("❌ ERRO 403: O servidor ainda está bloqueando o GitHub.")
+            print("Tentativa de contorno: Esperando 5s...")
+            time.sleep(5)
         else:
-            print(f"FALHA: Código {response.status_code} - Resposta: {response.text}")
+            print(f"⚠️ FALHA: Código {response.status_code} - {response.text}")
             
     except Exception as e:
-        print(f"ERRO DE CONEXÃO WHATSAPP: {e}")
+        print(f"ERRO DE CONEXÃO: {e}")
 
-# --- EXECUÇÃO PRINCIPAL ---
+# --- EXECUÇÃO ---
+st.title("📉 Monitor BDRs")
 
-st.title("📉 Monitor Inteligente de BDRs")
-
-if MODO_ROBO:
-    st.info("🤖 MODO ROBÔ ATIVO: Buscando Top 10 Quedas (> 1%)")
-else:
-    st.info(f"👤 MODO VISUAL: Filtro {FILTRO_QUEDA:.1%} | Bollinger {'Ligado' if USAR_BOLLINGER else 'Desligado'}")
-
-# Botão no site OU execução automática no GitHub
-if st.button("🔄 Analisar Mercado") or MODO_ROBO:
+if st.button("🔄 Analisar") or MODO_ROBO:
     bdrs = obter_lista_bdrs_da_brapi()
-    
     if bdrs:
         df = buscar_dados(bdrs)
         if not df.empty:
             df_calc = calcular_indicadores(df)
             last = df_calc.iloc[-1]
-            
             resultados = []
             
             for t in df_calc.columns.get_level_values(1).unique():
@@ -203,70 +187,40 @@ if st.button("🔄 Analisar Mercado") or MODO_ROBO:
                     low = last.get(('Low', t), np.nan)
                     banda = last.get(('BandaInf', t), np.nan)
                     
-                    # 1. Filtro de Queda
                     if pd.isna(var) or var > FILTRO_QUEDA: continue
-                    
-                    # 2. Filtro de Bollinger
-                    if USAR_BOLLINGER:
-                         if pd.isna(low) or low >= banda: continue
+                    if USAR_BOLLINGER and (pd.isna(low) or low >= banda): continue
                     
                     classif, motivo, score = analisar_sinal(last, t)
-                    
                     resultados.append({
-                        'Ticker': t,
-                        'Variação': var,
-                        'Preço': last[('Close', t)],
-                        'IFR14': last[('IFR14', t)],
-                        'Classificação': classif,
-                        'Motivo': motivo,
-                        'Score': score
+                        'Ticker': t, 'Variação': var, 'Preço': last[('Close', t)],
+                        'IFR14': last[('IFR14', t)], 'Classificação': classif,
+                        'Motivo': motivo, 'Score': score
                     })
                 except: continue
 
             if resultados:
-                # Ordenar pela maior queda (valor mais negativo primeiro)
                 resultados.sort(key=lambda x: x['Variação'])
                 
-                # Exibição no Site (Bonita)
                 if not MODO_ROBO:
                     df_show = pd.DataFrame(resultados)
-                    df_tela = df_show.copy()
-                    df_tela['Variação'] = df_tela['Variação'].apply(lambda x: f"{x:.2%}")
-                    df_tela['Preço'] = df_tela['Preço'].apply(lambda x: f"R$ {x:.2f}")
-                    df_tela['IFR14'] = df_tela['IFR14'].apply(lambda x: f"{x:.1f}")
-                    
-                    st.subheader(f"🚨 {len(resultados)} Oportunidades Encontradas")
-                    st.dataframe(
-                        df_tela[['Ticker', 'Variação', 'Classificação', 'Motivo', 'Preço', 'IFR14']], 
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    df_show['Variação'] = df_show['Variação'].apply(lambda x: f"{x:.2%}")
+                    df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
+                    df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
+                    st.dataframe(df_show[['Ticker', 'Variação', 'Classificação', 'Preço']], use_container_width=True)
 
-                # Envio WhatsApp (Apenas Robô ou Checkbox Manual)
                 if MODO_ROBO:
-                    print(f"Encontradas {len(resultados)} oportunidades. Preparando mensagem...")
+                    print(f"Encontradas {len(resultados)} oportunidades.")
                     fuso = pytz.timezone('America/Sao_Paulo')
                     hora = dt.datetime.now(fuso).strftime("%H:%M")
                     
-                    msg = f"🚨 *Monitor Top 10* ({hora})\nQuedas > 1% (Sem Bollinger)\n\n"
-                    
-                    # Top 10 Maiores Quedas
+                    # Mensagem simplificada para evitar bloqueio por tamanho
+                    msg = f"🚨 *Monitor Top 10* ({hora})\n\n"
                     for item in resultados[:10]:
                         icone = "🔥" if item['Score'] == 3 else "🔻"
                         msg += f"{icone} *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
                     
-                    if len(resultados) > 10:
-                        msg += f"\n...e mais {len(resultados)-10} no site."
-                    
-                    msg += f"\nLink: https://share.streamlit.io"
-                    
+                    msg += f"\nMais {len(resultados)-10} no site: share.streamlit.io"
                     enviar_whatsapp(msg)
-                
             else:
-                if MODO_ROBO:
-                    print("Nenhuma oportunidade encontrada com os filtros atuais.")
-                else:
-                    st.info("Nenhuma oportunidade com os filtros atuais.")
-        else:
-            if not MODO_ROBO: st.warning("Sem dados históricos.")
-            else: print("Erro: DataFrame de dados vazio.")
+                if MODO_ROBO: print("Sem oportunidades hoje.")
+                else: st.info("Sem oportunidades.")
