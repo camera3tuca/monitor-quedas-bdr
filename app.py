@@ -6,9 +6,13 @@ import numpy as np
 import os
 import datetime as dt
 import pytz
+import warnings
+
+# --- LIMPEZA DE LOGS ---
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor de Quedas BDRs", layout="wide")
+st.set_page_config(page_title="Monitor Pro BDRs", layout="wide", page_icon="📉")
 
 # --- FUNÇÃO DE SEGREDOS ---
 def get_secret(key):
@@ -20,17 +24,26 @@ def get_secret(key):
     except: pass
     return None
 
-# --- MODO ROBÔ ---
+# --- MODO ROBÔ VS HUMANO ---
 if os.environ.get("GITHUB_ACTIONS") == "true":
     MODO_ROBO = True
     FILTRO_QUEDA = -0.01  # Robô: -1%
-    USAR_BOLLINGER = False # Robô: Sem Bollinger
+    USAR_BOLLINGER = False # Robô: Ver tudo
 else:
     MODO_ROBO = False
-    # Site: Configuração Visual
-    st.sidebar.header("🎛️ Configurações (Site)")
+    
+# --- BARRA LATERAL (APENAS SITE) ---
+if not MODO_ROBO:
+    st.sidebar.title("🎛️ Painel de Controle")
+    st.sidebar.markdown("---")
+    
+    st.sidebar.subheader("Filtros de Análise")
     filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
-    bollinger_visual = st.sidebar.checkbox("Exigir estar abaixo da Banda?", value=True)
+    bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.info("💡 **Dica:** Desmarque a 'Banda de Bollinger' para ver ações que caíram muito, mas ainda não furaram a banda.")
+    
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
 
@@ -79,17 +92,23 @@ def calcular_indicadores(df):
         try:
             close = df[('Close', t)]
             vol = df[('Volume', t)]
+            
+            variacao = close.pct_change(fill_method=None)
+            
             delta = close.diff()
             ganho = delta.where(delta > 0, 0).ewm(com=13, adjust=False).mean()
             perda = -delta.where(delta < 0, 0).ewm(com=13, adjust=False).mean()
             ifr = 100 - (100 / (1 + (ganho/perda)))
+            
             inds[('IFR14', t)] = ifr.fillna(50)
             inds[('VolMedio', t)] = vol.rolling(10).mean()
-            inds[('Variacao', t)] = close.pct_change()
+            inds[('Variacao', t)] = variacao
+            
             sma = close.rolling(20).mean()
             std = close.rolling(20).std()
             inds[('BandaInf', t)] = sma - (std * 2)
         except: continue
+        
     if not inds: return pd.DataFrame()
     return df.join(pd.DataFrame(inds), how='left').sort_index(axis=1)
 
@@ -100,47 +119,55 @@ def analisar_sinal(row, t):
         ifr = row[('IFR14', t)]
         tem_vol = vol > vol_med if (not pd.isna(vol) and not pd.isna(vol_med)) else False
         tem_ifr = ifr < 30 if not pd.isna(ifr) else False
-        if tem_vol and tem_ifr: return "★★★ Forte", "Vol+IFR", 3
-        elif tem_vol: return "★★☆ Médio", "Volume", 2
-        elif tem_ifr: return "★★☆ Médio", "IFR", 2
-        else: return "★☆☆ Atenção", "Queda", 1
+        
+        # Lógica explicativa
+        if tem_vol and tem_ifr: return "★★★ Forte", "Volume Explosivo + IFR Baixo", 3
+        elif tem_vol: return "★★☆ Médio", "Volume Acima da Média", 2
+        elif tem_ifr: return "★★☆ Médio", "IFR < 30 (Sobrevenda)", 2
+        else: return "★☆☆ Atenção", "Apenas Queda (Furou Banda)", 1
     except: return "Erro", "-", 0
 
-# --- ENVIO IGUAL AO AZURE (COM CORREÇÃO PARA GITHUB) ---
 def enviar_whatsapp(msg):
-    print("--- ENVIO ESTILO AZURE ---")
-    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
-        print("Credenciais ausentes.")
-        return
-
+    print("--- ENVIO WHATSAPP ---")
+    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY: return
     try:
-        # 1. Codificação igual ao original
         texto_codificado = requests.utils.quote(msg)
-        
-        # 2. URL Manual igual ao original
         url_whatsapp = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
-        
-        # 3. O ÚNICO AJUSTE NECESSÁRIO PARA GITHUB (Cabeçalho Simples)
-        # Sem isto, o GitHub leva erro 403. Com isto, passa.
-        headers = {
-            "User-Agent": "Mozilla/5.0" 
-        }
-        
+        headers = { "User-Agent": "Mozilla/5.0" }
         response = requests.get(url_whatsapp, headers=headers, timeout=20)
+        if response.status_code == 200: print("✅ SUCESSO! Mensagem enviada.")
+        else: print(f"❌ ERRO {response.status_code}: {response.text}")
+    except Exception as e: print(f"Erro de conexão: {e}")
+
+# --- INTERFACE VISUAL (SITE) ---
+if not MODO_ROBO:
+    st.title("📉 Monitor de Oportunidades BDRs")
+    st.markdown("Identificador automático de reversões de tendência baseado em Bandas de Bollinger e IFR.")
+    
+    # 1. LEGENDA EXPLICATIVA (EXPANDER)
+    with st.expander("ℹ️ GUIA: Como ler a tabela de resultados? (Clique para abrir)"):
+        st.markdown("""
+        ### Classificação dos Sinais:
+        * **★★★ Sinal Forte:** O "Santo Graal" da reversão. A ação caiu abaixo da Banda de Bollinger, o Volume explodiu (pânico vendedor) E o IFR está abaixo de 30 (muito barato).
+        * **★★☆ Sinal Médio:** A ação caiu e tem um dos confirmadores: OU Volume alto OU IFR baixo.
+        * **★☆☆ Sinal de Atenção:** A ação caiu abaixo da banda, mas sem volume ou IFR extremo. Cuidado, pode ser uma "faca caindo".
         
-        if response.status_code == 200:
-            print("✅ SUCESSO! Mensagem enviada.")
-        else:
-            print(f"❌ ERRO {response.status_code}: {response.text}")
-            
-    except Exception as e:
-        print(f"Erro de conexão: {e}")
+        ### Colunas Técnicas:
+        * **IFR14:** Índice de Força Relativa. Abaixo de 30 é considerado "barato" (sobrevendido).
+        * **Motivo:** Explicação técnica do algoritmo para ter escolhido este ativo.
+        """)
 
-# --- EXECUÇÃO ---
-st.title("📉 Monitor BDRs")
+# --- EXECUÇÃO LÓGICA ---
+botao_analisar = st.button("🔄 Rodar Análise de Mercado") if not MODO_ROBO else True
 
-if st.button("🔄 Analisar") or MODO_ROBO:
+if botao_analisar:
     bdrs = obter_lista_bdrs_da_brapi()
+    
+    # MÉTRICAS RÁPIDAS (VISUAL)
+    if not MODO_ROBO and bdrs:
+        col1, col2 = st.columns(2)
+        col1.metric("Ativos Monitorados", len(bdrs))
+        
     if bdrs:
         df = buscar_dados(bdrs)
         if not df.empty:
@@ -168,13 +195,41 @@ if st.button("🔄 Analisar") or MODO_ROBO:
             if resultados:
                 resultados.sort(key=lambda x: x['Variação'])
                 
+                # --- VISUALIZAÇÃO NO SITE (PREMIUM) ---
                 if not MODO_ROBO:
+                    # Atualiza métrica de oportunidades
+                    col2.metric("Oportunidades Encontradas", len(resultados), delta=f"{len(resultados)} ações")
+
                     df_show = pd.DataFrame(resultados)
+                    # Formatação Visual
                     df_show['Variação'] = df_show['Variação'].apply(lambda x: f"{x:.2%}")
                     df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
-                    st.dataframe(df_show[['Ticker', 'Variação', 'Classificação', 'Preço']], use_container_width=True)
+                    
+                    st.subheader("📋 Relatório Detalhado")
+                    # TABELA COMPLETA COM MOTIVO E IFR
+                    st.dataframe(
+                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Motivo']], 
+                        use_container_width=True,
+                        column_config={
+                            "Ticker": st.column_config.TextColumn("Ativo", help="Código na Bolsa"),
+                            "Motivo": st.column_config.TextColumn("Análise Técnica", width="medium"),
+                        }
+                    )
+                    
+                    # Botão de Envio Manual
+                    st.markdown("---")
+                    st.write("📲 **Controle Manual**")
+                    if st.checkbox("Enviar este relatório para o meu WhatsApp agora?"):
+                        fuso = pytz.timezone('America/Sao_Paulo')
+                        hora = dt.datetime.now(fuso).strftime("%H:%M")
+                        msg = f"🚨 *Manual* ({hora})\n\n"
+                        for item in resultados[:10]:
+                            msg += f"-> *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
+                        enviar_whatsapp(msg)
+                        st.success("Comando de envio disparado!")
 
+                # --- MODO ROBÔ (SIMPLES E EFICIENTE) ---
                 if MODO_ROBO:
                     print(f"Encontradas {len(resultados)} oportunidades.")
                     fuso = pytz.timezone('America/Sao_Paulo')
@@ -189,4 +244,6 @@ if st.button("🔄 Analisar") or MODO_ROBO:
                     enviar_whatsapp(msg)
             else:
                 if MODO_ROBO: print("Sem oportunidades.")
-                else: st.info("Sem oportunidades.")
+                else: 
+                    col2.metric("Oportunidades", "0")
+                    st.info(f"Nenhum ativo caiu mais que {FILTRO_QUEDA:.0%} (Filtro atual). Tente ajustar a barra lateral.")
