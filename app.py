@@ -12,7 +12,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor Pro BDRs", layout="wide", page_icon="📉")
+st.set_page_config(page_title="Monitor Pro v13", layout="wide", page_icon="📉")
 
 # --- FUNÇÃO DE SEGREDOS ---
 def get_secret(key):
@@ -24,21 +24,23 @@ def get_secret(key):
     except: pass
     return None
 
-# --- MODO ROBÔ VS HUMANO ---
+# --- MODO ROBÔ ---
 if os.environ.get("GITHUB_ACTIONS") == "true":
     MODO_ROBO = True
     FILTRO_QUEDA = -0.01
     USAR_BOLLINGER = False
 else:
     MODO_ROBO = False
-    
-# --- BARRA LATERAL (APENAS SITE) ---
+
+# --- BARRA LATERAL (SITE) ---
 if not MODO_ROBO:
     st.sidebar.title("🎛️ Painel de Controle")
-    st.sidebar.info("Modo: Tabela Detalhada (Hora a Hora)")
+    st.sidebar.markdown("---")
     
     filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
+    
+    st.sidebar.info("Modo Visual: Tabela Completa (v9) + Horários")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -80,42 +82,51 @@ def buscar_dados(tickers):
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
-# --- NOVA FUNÇÃO: EVOLUÇÃO HORÁRIA ---
-def obter_evolucao_horaria(ticker):
+# --- FUNÇÃO CORRIGIDA: EVOLUÇÃO HORÁRIA ---
+def obter_evolucao_horaria_robusta(ticker):
     try:
-        # Baixa apenas o dia de hoje, intervalo de 1 hora
-        df = yf.download(f"{ticker}.SA", period="1d", interval="1h", progress=False, ignore_tz=True)
-        if df.empty: return "-"
+        # Usa 5 dias para garantir que pega o último pregão (evita erro de feriado/fim de semana)
+        df = yf.download(f"{ticker}.SA", period="5d", interval="60m", progress=False, ignore_tz=True)
+        if df.empty: return "Sem dados recentes"
         
-        # Converte índice para Horário de Brasília (se necessário ajustar manual)
-        # O yfinance geralmente traz UTC. Vamos simplificar pegando as horas.
+        # Pega a data do último registro disponível
+        ultima_data = df.index[-1].date()
         
-        evolucao_txt = []
-        # Preço de abertura do dia (primeira barra)
-        abertura_dia = df['Open'].iloc[0]
+        # Filtra apenas as velas desse dia
+        df_hoje = df[df.index.date == ultima_data]
         
-        for hora, row in df.iterrows():
-            # Converte UTC para Brasília (aproximado -3h se estiver em UTC)
-            # Nota: O yfinance varia dependendo do servidor, mas vamos tentar formatar a hora
-            hora_str = str(hora.hour - 3) if hora.hour >= 3 else str(hora.hour + 21) # Ajuste manual simples fuso
+        if df_hoje.empty: return "Sem dados hoje"
+        
+        # O preço de referência é a Abertura da primeira hora do dia
+        preco_abertura_dia = df_hoje['Open'].iloc[0]
+        
+        txt_evolucao = []
+        
+        for hora_timestamp, row in df_hoje.iterrows():
+            # Tenta ajustar fuso horário (yfinance costuma vir em UTC)
+            # Se for UTC, subtrai 3h para virar BRT.
+            hora_h = hora_timestamp.hour
             
-            # Se o timestamp já estiver correto (às vezes vem certo), usamos direto:
-            if df.index.tz is None: 
-                # Se não tem fuso, assume que já é local ou UTC
-                hora_display = hora.hour 
-            else:
-                 # Converte corretamente
-                 fuso_br = pytz.timezone('America/Sao_Paulo')
-                 hora_display = hora.astimezone(fuso_br).hour
-
-            # Filtra apenas horário de pregão comum (10h às 18h)
-            if 10 <= hora_display <= 18:
-                # Calcula variação em relação à ABERTURA DO DIA
-                var_momento = ((row['Close'] / abertura_dia) - 1)
-                evolucao_txt.append(f"{hora_display}h: {var_momento:+.1%}")
+            # Ajuste simplificado de fuso:
+            # Se a hora for > 12 e < 22, assumimos que é UTC e convertemos para BR
+            # O pregão BR é das 10h às 17/18h.
+            # Em UTC isso seria 13h às 20h.
+            
+            hora_display = hora_h
+            if hora_h >= 13: 
+                hora_display = hora_h - 3 # Converte UTC para BRT
+            
+            # Filtra horário comercial Brasil (aprox)
+            if 9 <= hora_display <= 18:
+                # Calcula variação vs Abertura do dia
+                var = (row['Close'] / preco_abertura_dia) - 1
+                txt_evolucao.append(f"{hora_display}h: {var:+.1%}")
         
-        return " ➡ ".join(evolucao_txt)
-    except:
+        if not txt_evolucao: return "Dados fora de horário"
+        
+        return " ➡ ".join(txt_evolucao)
+        
+    except Exception:
         return "-"
 
 def calcular_indicadores(df):
@@ -149,10 +160,10 @@ def analisar_sinal(row, t):
         tem_vol = vol > vol_med if (not pd.isna(vol) and not pd.isna(vol_med)) else False
         tem_ifr = ifr < 30 if not pd.isna(ifr) else False
         
-        if tem_vol and tem_ifr: return "★★★ Forte", "Vol Explosivo + IFR Baixo", 3
-        elif tem_vol: return "★★☆ Médio", "Volume Alto", 2
-        elif tem_ifr: return "★★☆ Médio", "IFR Sobrevenda", 2
-        else: return "★☆☆ Atenção", "Apenas Queda", 1
+        if tem_vol and tem_ifr: return "★★★ Forte", "Volume Explosivo + IFR Baixo", 3
+        elif tem_vol: return "★★☆ Médio", "Volume Acima da Média", 2
+        elif tem_ifr: return "★★☆ Médio", "IFR < 30 (Sobrevenda)", 2
+        else: return "★☆☆ Atenção", "Apenas Queda (Furou Banda)", 1
     except: return "Erro", "-", 0
 
 def enviar_whatsapp(msg):
@@ -166,20 +177,27 @@ def enviar_whatsapp(msg):
 
 # --- VISUAL (SITE) ---
 if not MODO_ROBO:
-    st.title("📉 Monitor BDRs (Detalhado)")
+    st.title("📉 Monitor Pro BDRs v13")
     
-    with st.expander("ℹ️ Legenda da Tabela"):
+    # 1. Guia Explicativo (v9 style)
+    with st.expander("ℹ️ GUIA: Entenda os Sinais (Clique aqui)"):
         st.markdown("""
-        * **Evolução Hoje:** Mostra a variação percentual acumulada em cada hora (em relação à abertura do dia).
-        * **Exemplo:** `10h: -0.5% ➡ 11h: -1.2%` significa que às 10h caía 0.5% e às 11h a queda piorou para 1.2%.
+        * **★★★ Sinal Forte:** Queda + Volume Alto + IFR Baixo (Reversão provável).
+        * **Evolução Hora-a-Hora:** Mostra a variação acumulada do dia em cada hora.
+          * Ex: `10h: -0.5% ➡ 12h: -1.0%` (A queda piorou ao longo da manhã).
         """)
 
 # --- EXECUÇÃO ---
-botao_analisar = st.button("🔄 Rodar Análise") if not MODO_ROBO else True
+botao_analisar = st.button("🔄 Rodar Análise de Mercado") if not MODO_ROBO else True
 
 if botao_analisar:
     bdrs = obter_lista_bdrs_da_brapi()
     
+    # Métricas de Topo (v9 style)
+    if not MODO_ROBO and bdrs:
+        col1, col2 = st.columns(2)
+        col1.metric("Ativos Monitorados", len(bdrs))
+        
     if bdrs:
         df = buscar_dados(bdrs)
         if not df.empty:
@@ -198,11 +216,10 @@ if botao_analisar:
                     
                     classif, motivo, score = analisar_sinal(last, t)
                     
-                    # --- NOVIDADE: Busca evolução horária AQUI ---
-                    # Só faz isso se estiver no modo Site (para não deixar o Robô lento)
-                    evolucao_str = "-"
+                    # Busca evolução horária (Apenas no Site para não travar o Robô)
+                    evolucao = "-"
                     if not MODO_ROBO:
-                        evolucao_str = obter_evolucao_horaria(t)
+                        evolucao = obter_evolucao_horaria_robusta(t)
 
                     resultados.append({
                         'Ticker': t, 
@@ -212,7 +229,7 @@ if botao_analisar:
                         'Classificação': classif,
                         'Motivo': motivo, 
                         'Score': score,
-                        'Evolução Hoje': evolucao_str # Nova coluna
+                        'Evolução Hora-a-Hora': evolucao
                     })
                 except: continue
 
@@ -221,20 +238,22 @@ if botao_analisar:
                 
                 # --- VISUALIZAÇÃO NO SITE ---
                 if not MODO_ROBO:
-                    st.metric("Oportunidades Encontradas", len(resultados))
+                    col2.metric("Oportunidades", len(resultados))
 
                     df_show = pd.DataFrame(resultados)
                     df_show['Variação'] = df_show['Variação'].apply(lambda x: f"{x:.2%}")
                     df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
-                    st.subheader("📋 Tabela Detalhada")
-                    # Mostra a tabela com a nova coluna
+                    st.subheader("📋 Relatório Completo")
+                    
+                    # TABELA COMPLETA (v9 + Coluna Nova)
                     st.dataframe(
-                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Evolução Hoje']], 
+                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Motivo', 'Evolução Hora-a-Hora']], 
                         use_container_width=True,
                         column_config={
-                            "Evolução Hoje": st.column_config.TextColumn("Variação Hora-a-Hora", width="large"),
+                            "Evolução Hora-a-Hora": st.column_config.TextColumn("Tendência Intraday (Hoje)", width="large"),
+                            "Motivo": st.column_config.TextColumn("Análise Técnica", width="medium"),
                         }
                     )
                     
@@ -260,4 +279,6 @@ if botao_analisar:
                     enviar_whatsapp(msg)
             else:
                 if MODO_ROBO: print("Sem oportunidades.")
-                else: st.info("Nenhuma oportunidade encontrada.")
+                else: 
+                    col2.metric("Oportunidades", "0")
+                    st.info("Nenhuma oportunidade encontrada.")
