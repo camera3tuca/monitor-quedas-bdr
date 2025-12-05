@@ -12,7 +12,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor Pro v13", layout="wide", page_icon="📉")
+st.set_page_config(page_title="Monitor Pro v14", layout="wide", page_icon="📉")
 
 # --- FUNÇÃO DE SEGREDOS ---
 def get_secret(key):
@@ -34,13 +34,13 @@ else:
 
 # --- BARRA LATERAL (SITE) ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel de Controle")
+    st.sidebar.title("🎛️ Painel v14")
     st.sidebar.markdown("---")
     
     filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
     
-    st.sidebar.info("Modo Visual: Tabela Completa (v9) + Horários")
+    st.sidebar.info("Modo Híbrido: Tenta hora-a-hora, mas garante Abertura vs Fecho se falhar.")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -82,52 +82,44 @@ def buscar_dados(tickers):
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
-# --- FUNÇÃO CORRIGIDA: EVOLUÇÃO HORÁRIA ---
-def obter_evolucao_horaria_robusta(ticker):
+# --- FUNÇÃO INTELIGENTE DE EVOLUÇÃO ---
+def obter_resumo_dia(ticker, open_daily, close_daily):
+    # Tenta buscar dados horários primeiro
     try:
-        # Usa 5 dias para garantir que pega o último pregão (evita erro de feriado/fim de semana)
-        df = yf.download(f"{ticker}.SA", period="5d", interval="60m", progress=False, ignore_tz=True)
-        if df.empty: return "Sem dados recentes"
+        # Pede 1 dia, intervalo de 1h
+        df = yf.download(f"{ticker}.SA", period="1d", interval="1h", progress=False, ignore_tz=True)
         
-        # Pega a data do último registro disponível
-        ultima_data = df.index[-1].date()
-        
-        # Filtra apenas as velas desse dia
-        df_hoje = df[df.index.date == ultima_data]
-        
-        if df_hoje.empty: return "Sem dados hoje"
-        
-        # O preço de referência é a Abertura da primeira hora do dia
-        preco_abertura_dia = df_hoje['Open'].iloc[0]
-        
-        txt_evolucao = []
-        
-        for hora_timestamp, row in df_hoje.iterrows():
-            # Tenta ajustar fuso horário (yfinance costuma vir em UTC)
-            # Se for UTC, subtrai 3h para virar BRT.
-            hora_h = hora_timestamp.hour
+        if not df.empty and len(df) > 1:
+            # Se a API retornou dados horários, formatamos eles
+            txt_partes = []
             
-            # Ajuste simplificado de fuso:
-            # Se a hora for > 12 e < 22, assumimos que é UTC e convertemos para BR
-            # O pregão BR é das 10h às 17/18h.
-            # Em UTC isso seria 13h às 20h.
+            # Pega até 4 pontos de dados para não encher a tela
+            # Ex: 10h, 12h, 14h, 16h...
+            for hora_ts, row in df.iterrows():
+                # Tenta simplificar a hora (pega a hora bruta do index)
+                h = hora_ts.hour
+                
+                # Pequeno ajuste de fuso "à bruta" se parecer UTC (maior que 12h de manhã)
+                # Mas vamos confiar no raw data primeiro
+                val = row['Close']
+                var_vs_open = (val / df['Open'].iloc[0]) - 1
+                
+                # Formata apenas se a variação for relevante ou a cada X horas
+                txt_partes.append(f"{h}h: {var_vs_open:+.1%}")
             
-            hora_display = hora_h
-            if hora_h >= 13: 
-                hora_display = hora_h - 3 # Converte UTC para BRT
+            # Se conseguiu montar a string, retorna ela (limitada aos últimos 4 pontos para caber)
+            return " ➡ ".join(txt_partes[-4:])
             
-            # Filtra horário comercial Brasil (aprox)
-            if 9 <= hora_display <= 18:
-                # Calcula variação vs Abertura do dia
-                var = (row['Close'] / preco_abertura_dia) - 1
-                txt_evolucao.append(f"{hora_display}h: {var:+.1%}")
-        
-        if not txt_evolucao: return "Dados fora de horário"
-        
-        return " ➡ ".join(txt_evolucao)
-        
     except Exception:
-        return "-"
+        pass
+    
+    # PLANO B: Se a API falhou ou veio vazia, usamos os dados diários que JÁ TEMOS
+    # Isso garante que nunca aparece "-" ou vazio.
+    try:
+        var_dia = (close_daily / open_daily) - 1
+        return f"Abertura: {open_daily:.2f} ➡ Atual: {close_daily:.2f} ({var_dia:+.1%})"
+    except:
+        return "Dados indisponíveis"
 
 def calcular_indicadores(df):
     df = df.copy()
@@ -137,14 +129,17 @@ def calcular_indicadores(df):
         try:
             close = df[('Close', t)]
             vol = df[('Volume', t)]
+            
             variacao = close.pct_change(fill_method=None)
             delta = close.diff()
             ganho = delta.where(delta > 0, 0).ewm(com=13, adjust=False).mean()
             perda = -delta.where(delta < 0, 0).ewm(com=13, adjust=False).mean()
             ifr = 100 - (100 / (1 + (ganho/perda)))
+            
             inds[('IFR14', t)] = ifr.fillna(50)
             inds[('VolMedio', t)] = vol.rolling(10).mean()
             inds[('Variacao', t)] = variacao
+            
             sma = close.rolling(20).mean()
             std = close.rolling(20).std()
             inds[('BandaInf', t)] = sma - (std * 2)
@@ -177,14 +172,12 @@ def enviar_whatsapp(msg):
 
 # --- VISUAL (SITE) ---
 if not MODO_ROBO:
-    st.title("📉 Monitor Pro BDRs v13")
+    st.title("📉 Monitor Pro v14")
     
-    # 1. Guia Explicativo (v9 style)
-    with st.expander("ℹ️ GUIA: Entenda os Sinais (Clique aqui)"):
+    with st.expander("ℹ️ Legenda da Tabela"):
         st.markdown("""
-        * **★★★ Sinal Forte:** Queda + Volume Alto + IFR Baixo (Reversão provável).
-        * **Evolução Hora-a-Hora:** Mostra a variação acumulada do dia em cada hora.
-          * Ex: `10h: -0.5% ➡ 12h: -1.0%` (A queda piorou ao longo da manhã).
+        * **Evolução do Dia:** Tenta mostrar a variação hora a hora.
+        * **Plano B:** Se a API falhar no detalhe horário, mostra "Abertura ➡ Atual" para garantir que você vê o movimento.
         """)
 
 # --- EXECUÇÃO ---
@@ -193,7 +186,6 @@ botao_analisar = st.button("🔄 Rodar Análise de Mercado") if not MODO_ROBO el
 if botao_analisar:
     bdrs = obter_lista_bdrs_da_brapi()
     
-    # Métricas de Topo (v9 style)
     if not MODO_ROBO and bdrs:
         col1, col2 = st.columns(2)
         col1.metric("Ativos Monitorados", len(bdrs))
@@ -216,10 +208,13 @@ if botao_analisar:
                     
                     classif, motivo, score = analisar_sinal(last, t)
                     
-                    # Busca evolução horária (Apenas no Site para não travar o Robô)
-                    evolucao = "-"
+                    # --- BUSCA INTELIGENTE DE DADOS ---
+                    resumo_dia = "-"
                     if not MODO_ROBO:
-                        evolucao = obter_evolucao_horaria_robusta(t)
+                        # Passamos o Open e Close diários para caso a API horária falhe
+                        p_open = last[('Open', t)]
+                        p_close = last[('Close', t)]
+                        resumo_dia = obter_resumo_dia(t, p_open, p_close)
 
                     resultados.append({
                         'Ticker': t, 
@@ -229,7 +224,7 @@ if botao_analisar:
                         'Classificação': classif,
                         'Motivo': motivo, 
                         'Score': score,
-                        'Evolução Hora-a-Hora': evolucao
+                        'Evolução do Dia': resumo_dia
                     })
                 except: continue
 
@@ -246,14 +241,11 @@ if botao_analisar:
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
                     st.subheader("📋 Relatório Completo")
-                    
-                    # TABELA COMPLETA (v9 + Coluna Nova)
                     st.dataframe(
-                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Motivo', 'Evolução Hora-a-Hora']], 
+                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Evolução do Dia']], 
                         use_container_width=True,
                         column_config={
-                            "Evolução Hora-a-Hora": st.column_config.TextColumn("Tendência Intraday (Hoje)", width="large"),
-                            "Motivo": st.column_config.TextColumn("Análise Técnica", width="medium"),
+                            "Evolução do Dia": st.column_config.TextColumn("Histórico Intraday", width="large"),
                         }
                     )
                     
