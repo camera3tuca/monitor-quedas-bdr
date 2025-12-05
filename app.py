@@ -27,22 +27,18 @@ def get_secret(key):
 # --- MODO ROBÔ VS HUMANO ---
 if os.environ.get("GITHUB_ACTIONS") == "true":
     MODO_ROBO = True
-    FILTRO_QUEDA = -0.01  # Robô: -1%
-    USAR_BOLLINGER = False # Robô: Ver tudo
+    FILTRO_QUEDA = -0.01
+    USAR_BOLLINGER = False
 else:
     MODO_ROBO = False
     
 # --- BARRA LATERAL (APENAS SITE) ---
 if not MODO_ROBO:
     st.sidebar.title("🎛️ Painel de Controle")
-    st.sidebar.markdown("---")
+    st.sidebar.info("Modo: Tabela Detalhada (Hora a Hora)")
     
-    st.sidebar.subheader("Filtros de Análise")
     filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
-    
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Dica:** Desmarque a 'Banda de Bollinger' para ver ações que caíram muito, mas ainda não furaram a banda.")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -84,6 +80,44 @@ def buscar_dados(tickers):
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
+# --- NOVA FUNÇÃO: EVOLUÇÃO HORÁRIA ---
+def obter_evolucao_horaria(ticker):
+    try:
+        # Baixa apenas o dia de hoje, intervalo de 1 hora
+        df = yf.download(f"{ticker}.SA", period="1d", interval="1h", progress=False, ignore_tz=True)
+        if df.empty: return "-"
+        
+        # Converte índice para Horário de Brasília (se necessário ajustar manual)
+        # O yfinance geralmente traz UTC. Vamos simplificar pegando as horas.
+        
+        evolucao_txt = []
+        # Preço de abertura do dia (primeira barra)
+        abertura_dia = df['Open'].iloc[0]
+        
+        for hora, row in df.iterrows():
+            # Converte UTC para Brasília (aproximado -3h se estiver em UTC)
+            # Nota: O yfinance varia dependendo do servidor, mas vamos tentar formatar a hora
+            hora_str = str(hora.hour - 3) if hora.hour >= 3 else str(hora.hour + 21) # Ajuste manual simples fuso
+            
+            # Se o timestamp já estiver correto (às vezes vem certo), usamos direto:
+            if df.index.tz is None: 
+                # Se não tem fuso, assume que já é local ou UTC
+                hora_display = hora.hour 
+            else:
+                 # Converte corretamente
+                 fuso_br = pytz.timezone('America/Sao_Paulo')
+                 hora_display = hora.astimezone(fuso_br).hour
+
+            # Filtra apenas horário de pregão comum (10h às 18h)
+            if 10 <= hora_display <= 18:
+                # Calcula variação em relação à ABERTURA DO DIA
+                var_momento = ((row['Close'] / abertura_dia) - 1)
+                evolucao_txt.append(f"{hora_display}h: {var_momento:+.1%}")
+        
+        return " ➡ ".join(evolucao_txt)
+    except:
+        return "-"
+
 def calcular_indicadores(df):
     df = df.copy()
     tickers = df.columns.get_level_values(1).unique()
@@ -92,23 +126,18 @@ def calcular_indicadores(df):
         try:
             close = df[('Close', t)]
             vol = df[('Volume', t)]
-            
             variacao = close.pct_change(fill_method=None)
-            
             delta = close.diff()
             ganho = delta.where(delta > 0, 0).ewm(com=13, adjust=False).mean()
             perda = -delta.where(delta < 0, 0).ewm(com=13, adjust=False).mean()
             ifr = 100 - (100 / (1 + (ganho/perda)))
-            
             inds[('IFR14', t)] = ifr.fillna(50)
             inds[('VolMedio', t)] = vol.rolling(10).mean()
             inds[('Variacao', t)] = variacao
-            
             sma = close.rolling(20).mean()
             std = close.rolling(20).std()
             inds[('BandaInf', t)] = sma - (std * 2)
         except: continue
-        
     if not inds: return pd.DataFrame()
     return df.join(pd.DataFrame(inds), how='left').sort_index(axis=1)
 
@@ -120,54 +149,37 @@ def analisar_sinal(row, t):
         tem_vol = vol > vol_med if (not pd.isna(vol) and not pd.isna(vol_med)) else False
         tem_ifr = ifr < 30 if not pd.isna(ifr) else False
         
-        # Lógica explicativa
-        if tem_vol and tem_ifr: return "★★★ Forte", "Volume Explosivo + IFR Baixo", 3
-        elif tem_vol: return "★★☆ Médio", "Volume Acima da Média", 2
-        elif tem_ifr: return "★★☆ Médio", "IFR < 30 (Sobrevenda)", 2
-        else: return "★☆☆ Atenção", "Apenas Queda (Furou Banda)", 1
+        if tem_vol and tem_ifr: return "★★★ Forte", "Vol Explosivo + IFR Baixo", 3
+        elif tem_vol: return "★★☆ Médio", "Volume Alto", 2
+        elif tem_ifr: return "★★☆ Médio", "IFR Sobrevenda", 2
+        else: return "★☆☆ Atenção", "Apenas Queda", 1
     except: return "Erro", "-", 0
 
 def enviar_whatsapp(msg):
-    print("--- ENVIO WHATSAPP ---")
     if not WHATSAPP_PHONE or not WHATSAPP_APIKEY: return
     try:
         texto_codificado = requests.utils.quote(msg)
         url_whatsapp = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
         headers = { "User-Agent": "Mozilla/5.0" }
-        response = requests.get(url_whatsapp, headers=headers, timeout=20)
-        if response.status_code == 200: print("✅ SUCESSO! Mensagem enviada.")
-        else: print(f"❌ ERRO {response.status_code}: {response.text}")
-    except Exception as e: print(f"Erro de conexão: {e}")
+        requests.get(url_whatsapp, headers=headers, timeout=20)
+    except: pass
 
-# --- INTERFACE VISUAL (SITE) ---
+# --- VISUAL (SITE) ---
 if not MODO_ROBO:
-    st.title("📉 Monitor de Oportunidades BDRs")
-    st.markdown("Identificador automático de reversões de tendência baseado em Bandas de Bollinger e IFR.")
+    st.title("📉 Monitor BDRs (Detalhado)")
     
-    # 1. LEGENDA EXPLICATIVA (EXPANDER)
-    with st.expander("ℹ️ GUIA: Como ler a tabela de resultados? (Clique para abrir)"):
+    with st.expander("ℹ️ Legenda da Tabela"):
         st.markdown("""
-        ### Classificação dos Sinais:
-        * **★★★ Sinal Forte:** O "Santo Graal" da reversão. A ação caiu abaixo da Banda de Bollinger, o Volume explodiu (pânico vendedor) E o IFR está abaixo de 30 (muito barato).
-        * **★★☆ Sinal Médio:** A ação caiu e tem um dos confirmadores: OU Volume alto OU IFR baixo.
-        * **★☆☆ Sinal de Atenção:** A ação caiu abaixo da banda, mas sem volume ou IFR extremo. Cuidado, pode ser uma "faca caindo".
-        
-        ### Colunas Técnicas:
-        * **IFR14:** Índice de Força Relativa. Abaixo de 30 é considerado "barato" (sobrevendido).
-        * **Motivo:** Explicação técnica do algoritmo para ter escolhido este ativo.
+        * **Evolução Hoje:** Mostra a variação percentual acumulada em cada hora (em relação à abertura do dia).
+        * **Exemplo:** `10h: -0.5% ➡ 11h: -1.2%` significa que às 10h caía 0.5% e às 11h a queda piorou para 1.2%.
         """)
 
-# --- EXECUÇÃO LÓGICA ---
-botao_analisar = st.button("🔄 Rodar Análise de Mercado") if not MODO_ROBO else True
+# --- EXECUÇÃO ---
+botao_analisar = st.button("🔄 Rodar Análise") if not MODO_ROBO else True
 
 if botao_analisar:
     bdrs = obter_lista_bdrs_da_brapi()
     
-    # MÉTRICAS RÁPIDAS (VISUAL)
-    if not MODO_ROBO and bdrs:
-        col1, col2 = st.columns(2)
-        col1.metric("Ativos Monitorados", len(bdrs))
-        
     if bdrs:
         df = buscar_dados(bdrs)
         if not df.empty:
@@ -185,65 +197,67 @@ if botao_analisar:
                     if USAR_BOLLINGER and (pd.isna(low) or low >= banda): continue
                     
                     classif, motivo, score = analisar_sinal(last, t)
+                    
+                    # --- NOVIDADE: Busca evolução horária AQUI ---
+                    # Só faz isso se estiver no modo Site (para não deixar o Robô lento)
+                    evolucao_str = "-"
+                    if not MODO_ROBO:
+                        evolucao_str = obter_evolucao_horaria(t)
+
                     resultados.append({
-                        'Ticker': t, 'Variação': var, 'Preço': last[('Close', t)],
-                        'IFR14': last[('IFR14', t)], 'Classificação': classif,
-                        'Motivo': motivo, 'Score': score
+                        'Ticker': t, 
+                        'Variação': var, 
+                        'Preço': last[('Close', t)],
+                        'IFR14': last[('IFR14', t)], 
+                        'Classificação': classif,
+                        'Motivo': motivo, 
+                        'Score': score,
+                        'Evolução Hoje': evolucao_str # Nova coluna
                     })
                 except: continue
 
             if resultados:
                 resultados.sort(key=lambda x: x['Variação'])
                 
-                # --- VISUALIZAÇÃO NO SITE (PREMIUM) ---
+                # --- VISUALIZAÇÃO NO SITE ---
                 if not MODO_ROBO:
-                    # Atualiza métrica de oportunidades
-                    col2.metric("Oportunidades Encontradas", len(resultados), delta=f"{len(resultados)} ações")
+                    st.metric("Oportunidades Encontradas", len(resultados))
 
                     df_show = pd.DataFrame(resultados)
-                    # Formatação Visual
                     df_show['Variação'] = df_show['Variação'].apply(lambda x: f"{x:.2%}")
                     df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
-                    st.subheader("📋 Relatório Detalhado")
-                    # TABELA COMPLETA COM MOTIVO E IFR
+                    st.subheader("📋 Tabela Detalhada")
+                    # Mostra a tabela com a nova coluna
                     st.dataframe(
-                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Motivo']], 
+                        df_show[['Ticker', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Evolução Hoje']], 
                         use_container_width=True,
                         column_config={
-                            "Ticker": st.column_config.TextColumn("Ativo", help="Código na Bolsa"),
-                            "Motivo": st.column_config.TextColumn("Análise Técnica", width="medium"),
+                            "Evolução Hoje": st.column_config.TextColumn("Variação Hora-a-Hora", width="large"),
                         }
                     )
                     
-                    # Botão de Envio Manual
-                    st.markdown("---")
-                    st.write("📲 **Controle Manual**")
-                    if st.checkbox("Enviar este relatório para o meu WhatsApp agora?"):
+                    if st.checkbox("Enviar WhatsApp Manual?"):
                         fuso = pytz.timezone('America/Sao_Paulo')
                         hora = dt.datetime.now(fuso).strftime("%H:%M")
                         msg = f"🚨 *Manual* ({hora})\n\n"
                         for item in resultados[:10]:
                             msg += f"-> *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
                         enviar_whatsapp(msg)
-                        st.success("Comando de envio disparado!")
+                        st.success("Enviado!")
 
-                # --- MODO ROBÔ (SIMPLES E EFICIENTE) ---
+                # --- MODO ROBÔ ---
                 if MODO_ROBO:
                     print(f"Encontradas {len(resultados)} oportunidades.")
                     fuso = pytz.timezone('America/Sao_Paulo')
                     hora = dt.datetime.now(fuso).strftime("%H:%M")
-                    
-                    msg = f"🚨 *Top 10 Quedas* ({hora})\n\n"
+                    msg = f"🚨 *Top 10* ({hora})\n\n"
                     for item in resultados[:10]:
                         icone = "🔥" if item['Score'] == 3 else "🔻"
                         msg += f"{icone} *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
-                    
-                    msg += f"\nMais {len(resultados)-10} no site: share.streamlit.io"
+                    msg += f"\nSite: share.streamlit.io"
                     enviar_whatsapp(msg)
             else:
                 if MODO_ROBO: print("Sem oportunidades.")
-                else: 
-                    col2.metric("Oportunidades", "0")
-                    st.info(f"Nenhum ativo caiu mais que {FILTRO_QUEDA:.0%} (Filtro atual). Tente ajustar a barra lateral.")
+                else: st.info("Nenhuma oportunidade encontrada.")
