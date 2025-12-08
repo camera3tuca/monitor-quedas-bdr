@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v17", layout="wide", page_icon="📉")
+st.set_page_config(page_title="Monitor BDR v18", layout="wide", page_icon="📉")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -38,19 +38,35 @@ BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 PERIODO_HISTORICO_DIAS = "60d"
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
+# --- SIDEBAR (IGUAL V14) ---
+if not MODO_ROBO:
+    st.sidebar.title("🎛️ Painel de Controle")
+    st.sidebar.markdown("---")
+    
+    filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
+    bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
+    
+    st.sidebar.info("Base: Versão 14 (Cálculo Original)")
+    
+    FILTRO_QUEDA = filtro_visual
+    USAR_BOLLINGER = bollinger_visual
+
 # --- FUNÇÕES ---
 
 @st.cache_data(ttl=3600)
 def obter_dados_brapi():
-    """Retorna Tickers e Mapa de Nomes"""
+    """Retorna lista de tickers E dicionário de nomes"""
     if not BRAPI_API_TOKEN: return [], {}
     try:
         url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
         r = requests.get(url, timeout=30)
         dados = r.json().get('stocks', [])
         
+        # Filtra BDRs
         bdrs_raw = [d for d in dados if d['stock'].endswith(TERMINACOES_BDR)]
+        
         lista_tickers = [d['stock'] for d in bdrs_raw]
+        # Mapa para pegar o nome: {'AAPL34': 'Apple Inc.', ...}
         mapa_nomes = {d['stock']: d.get('name', d['stock']) for d in bdrs_raw}
         
         return lista_tickers, mapa_nomes
@@ -72,9 +88,8 @@ def buscar_dados(tickers):
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
-# --- LÓGICA V14 (SEGURA) ---
+# LÓGICA V14 PURA (PLANO A + PLANO B)
 def obter_resumo_dia(ticker, open_daily, close_daily):
-    # Tenta dados horários
     try:
         df = yf.download(f"{ticker}.SA", period="1d", interval="1h", progress=False, ignore_tz=True)
         if not df.empty and len(df) > 1:
@@ -82,12 +97,13 @@ def obter_resumo_dia(ticker, open_daily, close_daily):
             for hora_ts, row in df.iterrows():
                 h = hora_ts.hour
                 val = row['Close']
+                # Usa o Open da API horária
                 var_vs_open = (val / df['Open'].iloc[0]) - 1
                 txt_partes.append(f"{h}h: {var_vs_open:+.1%}")
             return " ➡ ".join(txt_partes[-4:])
     except: pass
     
-    # Fallback (Plano B)
+    # Fallback V14
     try:
         var_dia = (close_daily / open_daily) - 1
         return f"Abertura: {open_daily:.2f} ➡ Atual: {close_daily:.2f} ({var_dia:+.1%})"
@@ -101,14 +117,19 @@ def calcular_indicadores(df):
         try:
             close = df[('Close', t)]
             vol = df[('Volume', t)]
+            
+            # CÁLCULO V14 (Original)
             variacao = close.pct_change(fill_method=None)
+            
             delta = close.diff()
             ganho = delta.where(delta > 0, 0).ewm(com=13, adjust=False).mean()
             perda = -delta.where(delta < 0, 0).ewm(com=13, adjust=False).mean()
             ifr = 100 - (100 / (1 + (ganho/perda)))
+            
             inds[('IFR14', t)] = ifr.fillna(50)
             inds[('VolMedio', t)] = vol.rolling(10).mean()
             inds[('Variacao', t)] = variacao
+            
             sma = close.rolling(20).mean()
             std = close.rolling(20).std()
             inds[('BandaInf', t)] = sma - (std * 2)
@@ -139,39 +160,36 @@ def enviar_whatsapp(msg):
         requests.get(url_whatsapp, headers=headers, timeout=20)
     except: pass
 
-# --- UI VISUAL (SITE) ---
+# --- UI PRINCIPAL ---
 
-# 1. Cabeçalho com Relógio
-fuso = pytz.timezone('America/Sao_Paulo')
-hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
+# 1. Relógio (Pedido)
+fuso_br = pytz.timezone('America/Sao_Paulo')
+hora_atual = dt.datetime.now(fuso_br).strftime("%H:%M")
 
 if not MODO_ROBO:
-    # Sidebar
-    st.sidebar.title("🎛️ Painel v17")
-    filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
-    bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
-    FILTRO_QUEDA = filtro_visual
-    USAR_BOLLINGER = bollinger_visual
-
-    # Header
+    # Cabeçalho Simples
     col_a, col_b = st.columns([3, 1])
     col_a.title("📉 Monitor BDR")
     col_b.metric("🕒 Hora Brasília", hora_atual)
     
-    # 2. Legenda Explicativa
-    with st.expander("ℹ️ Entenda a Classificação dos Sinais"):
+    # 2. Legenda (Pedido)
+    with st.expander("ℹ️ Entenda a Classificação"):
         st.markdown("""
-        * **★★★ Forte:** Queda acentuada + Volume alto (pânico) + IFR abaixo de 30 (barato).
-        * **★★☆ Médio:** Queda acentuada + (Volume alto OU IFR baixo).
-        * **★☆☆ Atenção:** Ação caiu e furou a Banda de Bollinger, mas sem volume expressivo.
+        * **★★★ Forte:** Queda + Volume Alto + IFR Baixo.
+        * **★★☆ Médio:** Queda + (Volume Alto OU IFR Baixo).
+        * **★☆☆ Atenção:** Apenas Queda (abaixo da Banda de Bollinger).
         """)
 
 # --- EXECUÇÃO ---
-botao_analisar = st.button("🔄 Rodar Análise Agora", type="primary") if not MODO_ROBO else True
+botao_analisar = st.button("🔄 Rodar Análise de Mercado") if not MODO_ROBO else True
 
 if botao_analisar:
+    # Pega dados e nomes
     lista_bdrs, mapa_nomes = obter_dados_brapi()
     
+    if not MODO_ROBO and lista_bdrs:
+        st.write(f"Analisando {len(lista_bdrs)} ativos...")
+        
     if lista_bdrs:
         df = buscar_dados(lista_bdrs)
         if not df.empty:
@@ -190,9 +208,9 @@ if botao_analisar:
                     
                     classif, motivo, score = analisar_sinal(last, t)
                     
-                    # Nome Curto (Apenas o primeiro nome)
+                    # Nome Curto (Pedido: Apenas o primeiro nome)
                     nome_completo = mapa_nomes.get(t, t)
-                    nome_curto = nome_completo.split()[0] if nome_completo else t
+                    primeiro_nome = nome_completo.split()[0] if nome_completo else t
                     
                     # Evolução v14
                     resumo_dia = "-"
@@ -201,7 +219,7 @@ if botao_analisar:
 
                     resultados.append({
                         'Ticker': t, 
-                        'Empresa': nome_curto, # Só o primeiro nome
+                        'Empresa': primeiro_nome, # Coluna Nova
                         'Variação': var, 
                         'Preço': last[('Close', t)],
                         'IFR14': last[('IFR14', t)], 
@@ -221,17 +239,17 @@ if botao_analisar:
                     
                     df_show = pd.DataFrame(resultados)
                     
-                    # TABELA CONFIGURADA
+                    # FORMATAÇÃO IGUAL V14 (TEXTO FIXO) PARA GARANTIR VALORES
+                    # Isso evita que o arredondamento automático mude o valor que vês
+                    df_show['Variação'] = df_show['Variação'].apply(lambda x: f"{x:.2%}")
+                    df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
+                    df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
+                    
+                    # Tabela Simples e Eficaz
                     st.dataframe(
-                        df_show[['Ticker', 'Empresa', 'Variação', 'Preço', 'Classificação', 'Motivo', 'Evolução do Dia']], 
+                        df_show[['Ticker', 'Empresa', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Evolução do Dia']], 
                         use_container_width=True,
-                        hide_index=True,
                         column_config={
-                            "Ticker": st.column_config.TextColumn("Código", width="small"),
-                            "Empresa": st.column_config.TextColumn("Nome", width="small"),
-                            "Variação": st.column_config.NumberColumn("Queda", format="%.2f%%"),
-                            "Preço": st.column_config.NumberColumn("Preço", format="R$ %.2f"),
-                            "Motivo": st.column_config.TextColumn("Explicação Técnica", width="medium"),
                             "Evolução do Dia": st.column_config.TextColumn("Tendência Intraday", width="large"),
                         }
                     )
@@ -239,7 +257,7 @@ if botao_analisar:
                     if st.checkbox("Enviar WhatsApp Manual?"):
                         msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação']} | {item['Classificação']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
@@ -249,7 +267,7 @@ if botao_analisar:
                     msg = f"🚨 *Top 10* ({hora_atual})\n\n"
                     for item in resultados[:10]:
                         icone = "🔥" if item['Score'] == 3 else "🔻"
-                        msg += f"{icone} *{item['Ticker']}* ({item['Empresa']}): {item['Variação']:.2%} | {item['Classificação']}\n"
+                        msg += f"{icone} *{item['Ticker']}*: {item['Variação']:.2%} | {item['Classificação']}\n"
                     msg += f"\nSite: share.streamlit.io"
                     enviar_whatsapp(msg)
             else:
