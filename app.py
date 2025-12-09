@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v21", layout="wide", page_icon="♻️")
+st.set_page_config(page_title="Monitor BDR v22", layout="wide", page_icon="📉")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -41,7 +41,7 @@ TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
 # --- SIDEBAR ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel v21")
+    st.sidebar.title("🎛️ Painel v22")
     st.sidebar.markdown("---")
     
     st.sidebar.header("Filtros")
@@ -49,7 +49,7 @@ if not MODO_ROBO:
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
     fibo_visual = st.sidebar.checkbox("💎 Fibo Golden Zone", value=False)
     
-    st.sidebar.info("Novidade: Análise de GAP e Recuperação Intraday.")
+    st.sidebar.info("Ordenação: Maiores Quedas Primeiro")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -182,16 +182,14 @@ hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
 
 if not MODO_ROBO:
     col_a, col_b = st.columns([3, 1])
-    col_a.title("📉 Monitor BDR v21")
+    col_a.title("📉 Monitor BDR v22")
     col_b.metric("🕒 Hora Brasília", hora_atual)
     
     with st.expander("ℹ️ Como ler o Gap e Recuperação?"):
         st.markdown("""
         * **GAP (Abertura):** Diferença entre o fechamento de ontem e a abertura de hoje.
-          * Se negativo, a ação já "nasceu" a cair.
         * **Intraday (Força):** Variação desde a abertura de hoje até agora.
-          * **Positivo:** Os compradores estão reagindo (Recuperação).
-          * **Negativo:** Os vendedores continuam batendo (Afundando).
+        * **Ordenação:** A tabela mostra primeiro as **Maiores Quedas** do dia.
         """)
 
 # --- EXECUÇÃO ---
@@ -218,24 +216,16 @@ if botao_analisar:
                     p_open = last[('Open', t)]
                     
                     # Cálculo Matemático do GAP e Intraday
-                    # Preço Ontem (Fechamento) = Preço Atual / (1 + Variação Total)
                     p_ontem = p_atual / (1 + var_total)
-                    
-                    # 1. GAP: (Abertura - Ontem) / Ontem
                     gap_pct = (p_open / p_ontem) - 1
-                    
-                    # 2. INTRADAY: (Atual - Abertura) / Abertura
                     intraday_pct = (p_atual / p_open) - 1
                     
                     # Definição do STATUS
                     status_movimento = "Neutro"
-                    if gap_pct < -0.005: # Teve Gap de baixa relevante (>0.5%)
-                        if intraday_pct > 0.002: # Subiu > 0.2% desde abertura
-                            status_movimento = "♻️ Recuperando"
-                        elif intraday_pct < -0.002: # Caiu > 0.2% desde abertura
-                            status_movimento = "📉 Afundando"
-                        else:
-                            status_movimento = "↔️ Lateral"
+                    if gap_pct < -0.005:
+                        if intraday_pct > 0.002: status_movimento = "♻️ Recuperando"
+                        elif intraday_pct < -0.002: status_movimento = "📉 Afundando"
+                        else: status_movimento = "↔️ Lateral"
                     elif intraday_pct < -0.01:
                          status_movimento = "🔻 Queda Intraday"
 
@@ -291,7 +281,8 @@ if botao_analisar:
                 except: continue
 
             if resultados:
-                resultados.sort(key=lambda x: (-x['Score'], x['Variação Total']))
+                # ORDENAÇÃO: APENAS PELA VARIAÇÃO TOTAL (ASCENDENTE = MAIOR QUEDA PRIMEIRO)
+                resultados.sort(key=lambda x: x['Variação Total'])
                 
                 if not MODO_ROBO:
                     st.success(f"{len(resultados)} oportunidades encontradas.")
@@ -310,9 +301,9 @@ if botao_analisar:
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "Variação Total": st.column_config.TextColumn("Total (vs Ontem)", help="Queda total em relação ao fechamento anterior."),
-                            "Gap Abertura": st.column_config.TextColumn("Gap (Abertura)", help="Diferença entre fechamento de ontem e abertura de hoje."),
-                            "Força Intraday": st.column_config.TextColumn("Força do Dia", help="Variação desde a abertura de hoje até agora."),
+                            "Variação Total": st.column_config.TextColumn("Total (vs Ontem)", width="small"),
+                            "Gap Abertura": st.column_config.TextColumn("Gap", width="small"),
+                            "Força Intraday": st.column_config.TextColumn("Intraday", width="small"),
                             "Status": st.column_config.TextColumn("Diagnóstico", width="medium"),
                             "Horário": st.column_config.TextColumn("Detalhe Hora-a-Hora", width="large"),
                         }
@@ -321,16 +312,16 @@ if botao_analisar:
                     if st.checkbox("Enviar WhatsApp Manual?"):
                         msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Status']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']:.2%} | {item['Status']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
                 if MODO_ROBO:
                     print(f"Encontradas {len(resultados)} oportunidades.")
                     msg = f"🚨 *Top 10* ({hora_atual})\n\n"
+                    # Como já ordenamos pela maior queda, o [:10] vai pegar as 10 piores
                     for item in resultados[:10]:
                         icone = "💎" if "FIBO" in item['Classificação'] else "🔻"
-                        # No WhatsApp, o Status (Recuperando/Afundando) é muito valioso
                         msg += f"{icone} *{item['Ticker']}* ({item['Empresa']}): {item['Variação Total']:.2%} | {item['Status']}\n"
                     msg += f"\nSite: share.streamlit.io"
                     enviar_whatsapp(msg)
