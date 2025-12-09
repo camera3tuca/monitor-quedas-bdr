@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v22", layout="wide", page_icon="📉")
+st.set_page_config(page_title="Monitor BDR v23", layout="wide", page_icon="📉")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -41,7 +41,7 @@ TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
 # --- SIDEBAR ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel v22")
+    st.sidebar.title("🎛️ Painel v23")
     st.sidebar.markdown("---")
     
     st.sidebar.header("Filtros")
@@ -83,20 +83,6 @@ def buscar_dados(tickers):
             df.columns = pd.MultiIndex.from_product([df.columns, [tickers[0]]])
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
-
-# LÓGICA V14 (HORA A HORA)
-def obter_resumo_horario(ticker):
-    try:
-        df = yf.download(f"{ticker}.SA", period="1d", interval="1h", progress=False, ignore_tz=True)
-        if not df.empty and len(df) > 1:
-            txt_partes = []
-            for hora_ts, row in df.iterrows():
-                h = hora_ts.hour
-                val = row['Close']
-                var_vs_open = (val / df['Open'].iloc[0]) - 1
-                txt_partes.append(f"{h}h: {var_vs_open:+.1%}")
-            return " ➡ ".join(txt_partes[-4:])
-    except: return "-"
 
 # FIBO
 def verificar_padrao_fibo(df_asset):
@@ -182,7 +168,7 @@ hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
 
 if not MODO_ROBO:
     col_a, col_b = st.columns([3, 1])
-    col_a.title("📉 Monitor BDR v22")
+    col_a.title("📉 Monitor BDR v23")
     col_b.metric("🕒 Hora Brasília", hora_atual)
     
     with st.expander("ℹ️ Como ler o Gap e Recuperação?"):
@@ -259,10 +245,9 @@ if botao_analisar:
                     nome_completo = mapa_nomes.get(t, t)
                     primeiro_nome = nome_completo.split()[0] if nome_completo else t
                     
-                    # Resumo Horário v14
-                    resumo_horario = "-"
-                    if not MODO_ROBO:
-                        resumo_horario = obter_resumo_horario(t)
+                    # RESUMO SIMPLES (Garantido de funcionar)
+                    # Mostra Abertura vs Atual (já temos esses dados, não precisa baixar nada novo)
+                    resumo_simples = f"Abertura: {p_open:.2f} ➡ Atual: {p_atual:.2f}"
 
                     resultados.append({
                         'Ticker': t, 
@@ -276,12 +261,12 @@ if botao_analisar:
                         'Status': status_movimento,
                         'Motivo': motivo, 
                         'Score': score,
-                        'Horário': resumo_horario
+                        'Evolução': resumo_simples # Coluna nova garantida
                     })
                 except: continue
 
             if resultados:
-                # ORDENAÇÃO: APENAS PELA VARIAÇÃO TOTAL (ASCENDENTE = MAIOR QUEDA PRIMEIRO)
+                # ORDENAÇÃO: MAIOR QUEDA PRIMEIRO
                 resultados.sort(key=lambda x: x['Variação Total'])
                 
                 if not MODO_ROBO:
@@ -297,22 +282,22 @@ if botao_analisar:
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
                     st.dataframe(
-                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'Preço', 'IFR14', 'Classificação', 'Horário']], 
+                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'IFR14', 'Classificação', 'Evolução']], 
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "Variação Total": st.column_config.TextColumn("Total (vs Ontem)", width="small"),
+                            "Variação Total": st.column_config.TextColumn("Total", width="small"),
                             "Gap Abertura": st.column_config.TextColumn("Gap", width="small"),
                             "Força Intraday": st.column_config.TextColumn("Intraday", width="small"),
                             "Status": st.column_config.TextColumn("Diagnóstico", width="medium"),
-                            "Horário": st.column_config.TextColumn("Detalhe Hora-a-Hora", width="large"),
+                            "Evolução": st.column_config.TextColumn("Evolução do Dia (R$)", width="medium"),
                         }
                     )
                     
                     if st.checkbox("Enviar WhatsApp Manual?"):
                         msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']:.2%} | {item['Status']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Status']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
