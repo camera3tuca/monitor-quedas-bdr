@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v20 (Fibo)", layout="wide", page_icon="💎")
+st.set_page_config(page_title="Monitor BDR v21", layout="wide", page_icon="♻️")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -27,7 +27,7 @@ if os.environ.get("GITHUB_ACTIONS") == "true":
     MODO_ROBO = True
     FILTRO_QUEDA = -0.01
     USAR_BOLLINGER = False
-    USAR_FIBO = False # Robô padrão: Quedas
+    USAR_FIBO = False
 else:
     MODO_ROBO = False
 
@@ -36,25 +36,20 @@ WHATSAPP_PHONE = get_secret('WHATSAPP_PHONE')
 WHATSAPP_APIKEY = get_secret('WHATSAPP_APIKEY')
 BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 
-# Aumentado para 250d para suportar a estratégia Fibo (EMA 50)
 PERIODO_HISTORICO_DIAS = "250d"
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
-# --- SIDEBAR (VISUAL V18 + OPÇÃO FIBO) ---
+# --- SIDEBAR ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel de Controle")
+    st.sidebar.title("🎛️ Painel v21")
     st.sidebar.markdown("---")
     
-    st.sidebar.header("1. Filtros de Queda")
-    filtro_visual = st.sidebar.slider("Mínimo de Queda (%)", -15, 0, -3, 1) / 100
+    st.sidebar.header("Filtros")
+    filtro_visual = st.sidebar.slider("Mínimo de Queda Total (%)", -15, 0, -3, 1) / 100
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
+    fibo_visual = st.sidebar.checkbox("💎 Fibo Golden Zone", value=False)
     
-    st.sidebar.markdown("---")
-    st.sidebar.header("2. Estratégia de Tendência")
-    # A NOVA OPÇÃO AQUI
-    fibo_visual = st.sidebar.checkbox("💎 Ativar Fibo Golden Zone", value=False, help="Ignora quedas e busca correções em tendência de alta.")
-    
-    st.sidebar.info("Base: Visual v18 + Motor Fibo")
+    st.sidebar.info("Novidade: Análise de GAP e Recuperação Intraday.")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -64,17 +59,14 @@ if not MODO_ROBO:
 
 @st.cache_data(ttl=3600)
 def obter_dados_brapi():
-    """Retorna lista de tickers E dicionário de nomes"""
     if not BRAPI_API_TOKEN: return [], {}
     try:
         url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
         r = requests.get(url, timeout=30)
         dados = r.json().get('stocks', [])
-        
         bdrs_raw = [d for d in dados if d['stock'].endswith(TERMINACOES_BDR)]
         lista_tickers = [d['stock'] for d in bdrs_raw]
         mapa_nomes = {d['stock']: d.get('name', d['stock']) for d in bdrs_raw}
-        
         return lista_tickers, mapa_nomes
     except: return [], {}
 
@@ -85,17 +77,15 @@ def buscar_dados(tickers):
         if MODO_ROBO: print(f"Baixando dados de {len(tickers)} ativos...")
         df = yf.download(sa_tickers, period=PERIODO_HISTORICO_DIAS, auto_adjust=True, progress=False, ignore_tz=True)
         if df.empty: return pd.DataFrame()
-        
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = pd.MultiIndex.from_tuples([(c[0], c[1].replace(".SA", "")) for c in df.columns])
         elif isinstance(df.index, pd.DatetimeIndex) and len(tickers) == 1:
             df.columns = pd.MultiIndex.from_product([df.columns, [tickers[0]]])
-            
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
-# LÓGICA V14 PURA (EVOLUÇÃO HORÁRIA)
-def obter_resumo_dia(ticker, open_daily, close_daily):
+# LÓGICA V14 (HORA A HORA)
+def obter_resumo_horario(ticker):
     try:
         df = yf.download(f"{ticker}.SA", period="1d", interval="1h", progress=False, ignore_tz=True)
         if not df.empty and len(df) > 1:
@@ -106,57 +96,34 @@ def obter_resumo_dia(ticker, open_daily, close_daily):
                 var_vs_open = (val / df['Open'].iloc[0]) - 1
                 txt_partes.append(f"{h}h: {var_vs_open:+.1%}")
             return " ➡ ".join(txt_partes[-4:])
-    except: pass
-    
-    try:
-        var_dia = (close_daily / open_daily) - 1
-        return f"Abertura: {open_daily:.2f} ➡ Atual: {close_daily:.2f} ({var_dia:+.1%})"
     except: return "-"
 
-# NOVA LÓGICA: FIBO GOLDEN ZONE
+# FIBO
 def verificar_padrao_fibo(df_asset):
-    # Parâmetros
-    EMA_TENDENCIA = 50
-    JANELA_TOPO = 20
-    JANELA_FUNDO = 60
-    
     try:
-        if len(df_asset) < JANELA_FUNDO + 10: return None
+        if len(df_asset) < 70: return None
+        close = df_asset['Close']; high = df_asset['High']; low = df_asset['Low']
         
-        close = df_asset['Close']
-        high = df_asset['High']
-        low = df_asset['Low']
-        
-        # 1. Tendência de Alta (Preço > EMA 50)
-        ema_trend = close.ewm(span=EMA_TENDENCIA).mean()
+        # Tendencia
+        ema_trend = close.ewm(span=50).mean()
         if close.iloc[-1] < ema_trend.iloc[-1]: return None
         
-        # 2. Identificar Topo e Fundo
-        recorte_topo = high.tail(JANELA_TOPO)
-        topo_val = recorte_topo.max()
-        topo_idx = recorte_topo.idxmax()
+        recorte_topo = high.tail(20)
+        topo_val = recorte_topo.max(); topo_idx = recorte_topo.idxmax()
         
-        df_antes_topo = df_asset.loc[:topo_idx].iloc[:-1]
-        if len(df_antes_topo) < JANELA_FUNDO: return None
-        
-        recorte_fundo = df_antes_topo['Low'].tail(JANELA_FUNDO)
-        fundo_val = recorte_fundo.min()
+        df_antes = df_asset.loc[:topo_idx].iloc[:-1]
+        if len(df_antes) < 60: return None
+        fundo_val = df_antes['Low'].tail(60).min()
         
         diff = topo_val - fundo_val
-        if diff <= 0 or (diff / fundo_val) < 0.08: return None
+        if diff <= 0 or (diff/fundo_val) < 0.08: return None
         
-        # 3. Níveis Fibo
-        fibo_500 = topo_val - (diff * 0.500)
         fibo_618 = topo_val - (diff * 0.618)
+        fibo_500 = topo_val - (diff * 0.500)
         
-        # 4. Zona de Compra
-        low_hoje = low.iloc[-1]
-        zona_topo = fibo_500 * 1.01
-        zona_fundo = fibo_618 * 0.99
-        
-        if low_hoje <= zona_topo and low_hoje >= zona_fundo:
-            return f"Golden Zone (R$ {fibo_618:.2f}-{fibo_500:.2f})"
-        
+        low_hj = low.iloc[-1]
+        if low_hj <= fibo_500*1.01 and low_hj >= fibo_618*0.99:
+            return f"Golden Zone"
         return None
     except: return None
 
@@ -168,7 +135,6 @@ def calcular_indicadores(df):
         try:
             close = df[('Close', t)]
             vol = df[('Volume', t)]
-            
             variacao = close.pct_change(fill_method=None)
             
             delta = close.diff()
@@ -195,10 +161,10 @@ def analisar_sinal_classico(row, t):
         tem_vol = vol > vol_med if (not pd.isna(vol) and not pd.isna(vol_med)) else False
         tem_ifr = ifr < 30 if not pd.isna(ifr) else False
         
-        if tem_vol and tem_ifr: return "★★★ Forte", "Volume Explosivo + IFR Baixo", 3
-        elif tem_vol: return "★★☆ Médio", "Volume Acima da Média", 2
-        elif tem_ifr: return "★★☆ Médio", "IFR < 30 (Sobrevenda)", 2
-        else: return "★☆☆ Atenção", "Apenas Queda (Furou Banda)", 1
+        if tem_vol and tem_ifr: return "★★★ Forte", "Vol + IFR", 3
+        elif tem_vol: return "★★☆ Médio", "Volume", 2
+        elif tem_ifr: return "★★☆ Médio", "IFR", 2
+        else: return "★☆☆ Atenção", "Queda", 1
     except: return "Erro", "-", 0
 
 def enviar_whatsapp(msg):
@@ -210,20 +176,22 @@ def enviar_whatsapp(msg):
         requests.get(url_whatsapp, headers=headers, timeout=20)
     except: pass
 
-# --- UI PRINCIPAL (ESTILO V18) ---
-fuso_br = pytz.timezone('America/Sao_Paulo')
-hora_atual = dt.datetime.now(fuso_br).strftime("%H:%M")
+# --- UI VISUAL ---
+fuso = pytz.timezone('America/Sao_Paulo')
+hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
 
 if not MODO_ROBO:
     col_a, col_b = st.columns([3, 1])
-    col_a.title("📉 Monitor BDR Pro")
+    col_a.title("📉 Monitor BDR v21")
     col_b.metric("🕒 Hora Brasília", hora_atual)
     
-    with st.expander("ℹ️ Legenda"):
+    with st.expander("ℹ️ Como ler o Gap e Recuperação?"):
         st.markdown("""
-        * **Estratégia Clássica:** Busca ativos sobrevendidos (quedas fortes).
-        * **Fibo Golden Zone:** Busca ativos em tendência de alta corrigindo.
-        * **Evolução:** Mostra a tendência intraday ou Abertura/Atual.
+        * **GAP (Abertura):** Diferença entre o fechamento de ontem e a abertura de hoje.
+          * Se negativo, a ação já "nasceu" a cair.
+        * **Intraday (Força):** Variação desde a abertura de hoje até agora.
+          * **Positivo:** Os compradores estão reagindo (Recuperação).
+          * **Negativo:** Os vendedores continuam batendo (Afundando).
         """)
 
 # --- EXECUÇÃO ---
@@ -233,7 +201,7 @@ if botao_analisar:
     lista_bdrs, mapa_nomes = obter_dados_brapi()
     
     if not MODO_ROBO and lista_bdrs:
-        st.write(f"Analisando {len(lista_bdrs)} ativos (Histórico Ampliado)...")
+        st.write(f"Analisando {len(lista_bdrs)} ativos...")
         
     if lista_bdrs:
         df = buscar_dados(lista_bdrs)
@@ -244,13 +212,37 @@ if botao_analisar:
             
             for t in df_calc.columns.get_level_values(1).unique():
                 try:
-                    var = last.get(('Variacao', t), np.nan)
+                    # DADOS BÁSICOS
+                    var_total = last.get(('Variacao', t), np.nan)
+                    p_atual = last[('Close', t)]
+                    p_open = last[('Open', t)]
+                    
+                    # Cálculo Matemático do GAP e Intraday
+                    # Preço Ontem (Fechamento) = Preço Atual / (1 + Variação Total)
+                    p_ontem = p_atual / (1 + var_total)
+                    
+                    # 1. GAP: (Abertura - Ontem) / Ontem
+                    gap_pct = (p_open / p_ontem) - 1
+                    
+                    # 2. INTRADAY: (Atual - Abertura) / Abertura
+                    intraday_pct = (p_atual / p_open) - 1
+                    
+                    # Definição do STATUS
+                    status_movimento = "Neutro"
+                    if gap_pct < -0.005: # Teve Gap de baixa relevante (>0.5%)
+                        if intraday_pct > 0.002: # Subiu > 0.2% desde abertura
+                            status_movimento = "♻️ Recuperando"
+                        elif intraday_pct < -0.002: # Caiu > 0.2% desde abertura
+                            status_movimento = "📉 Afundando"
+                        else:
+                            status_movimento = "↔️ Lateral"
+                    elif intraday_pct < -0.01:
+                         status_movimento = "🔻 Queda Intraday"
+
+                    # FILTROS
                     low = last.get(('Low', t), np.nan)
                     banda = last.get(('BandaInf', t), np.nan)
                     
-                    # --- LÓGICA DE FILTROS ---
-                    
-                    # 1. Analisa Fibo (se ativado)
                     sinal_fibo = None
                     if USAR_FIBO:
                         try:
@@ -258,18 +250,15 @@ if botao_analisar:
                             sinal_fibo = verificar_padrao_fibo(df_ticker)
                         except: pass
                     
-                    # 2. Analisa Queda (se Fibo não for exclusivo ou se Fibo não achou nada)
                     passou_queda = False
-                    if not USAR_FIBO: # Se Fibo desligado, usa Queda
+                    if not USAR_FIBO:
                         passou_queda = True
                         if USAR_BOLLINGER and (pd.isna(low) or low >= banda): passou_queda = False
-                        if pd.isna(var) or var > FILTRO_QUEDA: passou_queda = False
+                        if pd.isna(var_total) or var_total > FILTRO_QUEDA: passou_queda = False
                     
-                    # DECISÃO FINAL: Entra no relatório?
                     if USAR_FIBO and not sinal_fibo: continue
                     if not USAR_FIBO and not passou_queda: continue
                     
-                    # MONTAGEM DOS DADOS
                     if sinal_fibo:
                         classif = "💎 FIBO"
                         motivo = sinal_fibo
@@ -280,49 +269,59 @@ if botao_analisar:
                     nome_completo = mapa_nomes.get(t, t)
                     primeiro_nome = nome_completo.split()[0] if nome_completo else t
                     
-                    resumo_dia = "-"
+                    # Resumo Horário v14
+                    resumo_horario = "-"
                     if not MODO_ROBO:
-                         resumo_dia = obter_resumo_dia(t, last[('Open', t)], last[('Close', t)])
+                        resumo_horario = obter_resumo_horario(t)
 
                     resultados.append({
                         'Ticker': t, 
                         'Empresa': primeiro_nome,
-                        'Variação': var, 
-                        'Preço': last[('Close', t)],
+                        'Variação Total': var_total, 
+                        'Gap Abertura': gap_pct,
+                        'Força Intraday': intraday_pct,
+                        'Preço': p_atual,
                         'IFR14': last[('IFR14', t)], 
                         'Classificação': classif,
+                        'Status': status_movimento,
                         'Motivo': motivo, 
                         'Score': score,
-                        'Evolução do Dia': resumo_dia
+                        'Horário': resumo_horario
                     })
                 except: continue
 
             if resultados:
-                # Ordena: Fibo primeiro, depois maior queda
-                resultados.sort(key=lambda x: (-x['Score'], x['Variação']))
+                resultados.sort(key=lambda x: (-x['Score'], x['Variação Total']))
                 
                 if not MODO_ROBO:
                     st.success(f"{len(resultados)} oportunidades encontradas.")
                     
                     df_show = pd.DataFrame(resultados)
                     
-                    # FORMATAÇÃO VISUAL V14 (Numérica String)
-                    df_show['Variação'] = df_show['Variação'].apply(lambda x: f"{x:.2%}")
+                    # FORMATAÇÃO VISUAL
+                    df_show['Variação Total'] = df_show['Variação Total'].apply(lambda x: f"{x:.2%}")
+                    df_show['Gap Abertura'] = df_show['Gap Abertura'].apply(lambda x: f"{x:.2%}")
+                    df_show['Força Intraday'] = df_show['Força Intraday'].apply(lambda x: f"{x:.2%}")
                     df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
                     st.dataframe(
-                        df_show[['Ticker', 'Empresa', 'Variação', 'Preço', 'IFR14', 'Classificação', 'Motivo', 'Evolução do Dia']], 
+                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'Preço', 'IFR14', 'Classificação', 'Horário']], 
                         use_container_width=True,
+                        hide_index=True,
                         column_config={
-                            "Evolução do Dia": st.column_config.TextColumn("Tendência Intraday", width="large"),
+                            "Variação Total": st.column_config.TextColumn("Total (vs Ontem)", help="Queda total em relação ao fechamento anterior."),
+                            "Gap Abertura": st.column_config.TextColumn("Gap (Abertura)", help="Diferença entre fechamento de ontem e abertura de hoje."),
+                            "Força Intraday": st.column_config.TextColumn("Força do Dia", help="Variação desde a abertura de hoje até agora."),
+                            "Status": st.column_config.TextColumn("Diagnóstico", width="medium"),
+                            "Horário": st.column_config.TextColumn("Detalhe Hora-a-Hora", width="large"),
                         }
                     )
                     
                     if st.checkbox("Enviar WhatsApp Manual?"):
                         msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação']} | {item['Classificação']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Status']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
@@ -331,7 +330,8 @@ if botao_analisar:
                     msg = f"🚨 *Top 10* ({hora_atual})\n\n"
                     for item in resultados[:10]:
                         icone = "💎" if "FIBO" in item['Classificação'] else "🔻"
-                        msg += f"{icone} *{item['Ticker']}* ({item['Empresa']}): {item['Variação']:.2%} | {item['Classificação']}\n"
+                        # No WhatsApp, o Status (Recuperando/Afundando) é muito valioso
+                        msg += f"{icone} *{item['Ticker']}* ({item['Empresa']}): {item['Variação Total']:.2%} | {item['Status']}\n"
                     msg += f"\nSite: share.streamlit.io"
                     enviar_whatsapp(msg)
             else:
