@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v26", layout="wide", page_icon="♻️")
+st.set_page_config(page_title="Monitor BDR v23", layout="wide", page_icon="📉")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -39,9 +39,9 @@ BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 PERIODO_HISTORICO_DIAS = "250d"
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
-# --- SIDEBAR (VISUAL V23) ---
+# --- SIDEBAR ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel v26")
+    st.sidebar.title("🎛️ Painel v23")
     st.sidebar.markdown("---")
     
     st.sidebar.header("Filtros")
@@ -49,7 +49,7 @@ if not MODO_ROBO:
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
     fibo_visual = st.sidebar.checkbox("💎 Fibo Golden Zone", value=False)
     
-    st.sidebar.info("Site: Detalhado (v23) | WhatsApp: Limpo")
+    st.sidebar.info("Ordenação: Maiores Quedas Primeiro")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -89,17 +89,24 @@ def verificar_padrao_fibo(df_asset):
     try:
         if len(df_asset) < 70: return None
         close = df_asset['Close']; high = df_asset['High']; low = df_asset['Low']
+        
+        # Tendencia
         ema_trend = close.ewm(span=50).mean()
         if close.iloc[-1] < ema_trend.iloc[-1]: return None
+        
         recorte_topo = high.tail(20)
         topo_val = recorte_topo.max(); topo_idx = recorte_topo.idxmax()
+        
         df_antes = df_asset.loc[:topo_idx].iloc[:-1]
         if len(df_antes) < 60: return None
         fundo_val = df_antes['Low'].tail(60).min()
+        
         diff = topo_val - fundo_val
         if diff <= 0 or (diff/fundo_val) < 0.08: return None
+        
         fibo_618 = topo_val - (diff * 0.618)
         fibo_500 = topo_val - (diff * 0.500)
+        
         low_hj = low.iloc[-1]
         if low_hj <= fibo_500*1.01 and low_hj >= fibo_618*0.99:
             return f"Golden Zone"
@@ -146,35 +153,35 @@ def analisar_sinal_classico(row, t):
         else: return "★☆☆ Atenção", "Queda", 1
     except: return "Erro", "-", 0
 
-# --- ENVIO CORRIGIDO (COM HEADERS PARA EVITAR 403) ---
 def enviar_whatsapp(msg):
-    print("--- TENTANDO ENVIAR WHATSAPP ---")
-    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
-        print("ERRO: Credenciais ausentes.")
-        return
-
+    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY: return
     try:
         texto_codificado = requests.utils.quote(msg)
         url_whatsapp = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
-        
-        # O SEGREDRO PARA O GITHUB NÃO SER BLOQUEADO
         headers = { "User-Agent": "Mozilla/5.0" }
-        
-        response = requests.get(url_whatsapp, headers=headers, timeout=25)
-        
-        if response.status_code == 200:
-            print("✅ SUCESSO! Mensagem enviada.")
-        else:
-            print(f"❌ ERRO {response.status_code}: {response.text}")
-            
-    except Exception as e:
-        print(f"Erro de conexão: {e}")
+        requests.get(url_whatsapp, headers=headers, timeout=20)
+    except: pass
+
+# --- UI VISUAL ---
+fuso = pytz.timezone('America/Sao_Paulo')
+hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
+
+if not MODO_ROBO:
+    col_a, col_b = st.columns([3, 1])
+    col_a.title("📉 Monitor BDR v23")
+    col_b.metric("🕒 Hora Brasília", hora_atual)
+    
+    with st.expander("ℹ️ Como ler o Gap e Recuperação?"):
+        st.markdown("""
+        * **GAP (Abertura):** Diferença entre o fechamento de ontem e a abertura de hoje.
+        * **Intraday (Força):** Variação desde a abertura de hoje até agora.
+        * **Ordenação:** A tabela mostra primeiro as **Maiores Quedas** do dia.
+        """)
 
 # --- EXECUÇÃO ---
-# No modo robô roda direto, no site precisa do botão
-start_btn = True if MODO_ROBO else st.button("🔄 Rodar Análise Agora", type="primary")
+botao_analisar = st.button("🔄 Rodar Análise Agora", type="primary") if not MODO_ROBO else True
 
-if start_btn:
+if botao_analisar:
     lista_bdrs, mapa_nomes = obter_dados_brapi()
     
     if not MODO_ROBO and lista_bdrs:
@@ -199,7 +206,7 @@ if start_btn:
                     gap_pct = (p_open / p_ontem) - 1
                     intraday_pct = (p_atual / p_open) - 1
                     
-                    # Definição do STATUS (Lógica v23)
+                    # Definição do STATUS
                     status_movimento = "Neutro"
                     if gap_pct < -0.005:
                         if intraday_pct > 0.002: status_movimento = "♻️ Recuperando"
@@ -238,7 +245,8 @@ if start_btn:
                     nome_completo = mapa_nomes.get(t, t)
                     primeiro_nome = nome_completo.split()[0] if nome_completo else t
                     
-                    # Resumo Simples (Abertura vs Atual)
+                    # RESUMO SIMPLES (Garantido de funcionar)
+                    # Mostra Abertura vs Atual (já temos esses dados, não precisa baixar nada novo)
                     resumo_simples = f"Abertura: {p_open:.2f} ➡ Atual: {p_atual:.2f}"
 
                     resultados.append({
@@ -253,15 +261,14 @@ if start_btn:
                         'Status': status_movimento,
                         'Motivo': motivo, 
                         'Score': score,
-                        'Evolução': resumo_simples
+                        'Evolução': resumo_simples # Coluna nova garantida
                     })
                 except: continue
 
             if resultados:
-                # ORDENAÇÃO: Maior Queda Primeiro
+                # ORDENAÇÃO: MAIOR QUEDA PRIMEIRO
                 resultados.sort(key=lambda x: x['Variação Total'])
                 
-                # --- VISUALIZAÇÃO SITE (VISUAL V23) ---
                 if not MODO_ROBO:
                     st.success(f"{len(resultados)} oportunidades encontradas.")
                     
@@ -274,9 +281,8 @@ if start_btn:
                     df_show['Preço'] = df_show['Preço'].apply(lambda x: f"R$ {x:.2f}")
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
-                    # Tabela Completa do v23
                     st.dataframe(
-                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'Preço', 'IFR14', 'Classificação', 'Evolução']], 
+                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'IFR14', 'Classificação', 'Evolução']], 
                         use_container_width=True,
                         hide_index=True,
                         column_config={
@@ -284,37 +290,25 @@ if start_btn:
                             "Gap Abertura": st.column_config.TextColumn("Gap", width="small"),
                             "Força Intraday": st.column_config.TextColumn("Intraday", width="small"),
                             "Status": st.column_config.TextColumn("Diagnóstico", width="medium"),
-                            "Evolução": st.column_config.TextColumn("Abertura ➡ Atual", width="medium"),
+                            "Evolução": st.column_config.TextColumn("Evolução do Dia (R$)", width="medium"),
                         }
                     )
                     
                     if st.checkbox("Enviar WhatsApp Manual?"):
-                        fuso = pytz.timezone('America/Sao_Paulo')
-                        hora = dt.datetime.now(fuso).strftime("%H:%M")
-                        msg = f"🚨 *Manual* ({hora})\n\n"
+                        msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']:.2%} | {item['Classificação']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Status']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
-                # --- MODO ROBÔ (WHATSAPP LIMPO) ---
                 if MODO_ROBO:
-                    print(f"Encontradas {len(resultados)} oportunidades. Preparando envio...")
-                    fuso = pytz.timezone('America/Sao_Paulo')
-                    hora = dt.datetime.now(fuso).strftime("%H:%M")
-                    
-                    msg = f"🚨 *Top Quedas* ({hora})\n\n"
-                    
-                    # Loop Limpo (Apenas Ticker + Queda)
+                    print(f"Encontradas {len(resultados)} oportunidades.")
+                    msg = f"🚨 *Top 10* ({hora_atual})\n\n"
+                    # Como já ordenamos pela maior queda, o [:10] vai pegar as 10 piores
                     for item in resultados[:10]:
                         icone = "💎" if "FIBO" in item['Classificação'] else "🔻"
-                        # Formata % para o WhatsApp
-                        queda_txt = f"{item['Variação Total']:.2%}"
-                        
-                        # MENSAGEM LIMPA
-                        msg += f"{icone} *{item['Ticker']}*: {queda_txt} | {item['Classificação']}\n"
-                    
-                    msg += f"\nDetalhes: share.streamlit.io"
+                        msg += f"{icone} *{item['Ticker']}* ({item['Empresa']}): {item['Variação Total']:.2%} | {item['Status']}\n"
+                    msg += f"\nSite: share.streamlit.io"
                     enviar_whatsapp(msg)
             else:
                 if MODO_ROBO: print("Sem oportunidades.")
