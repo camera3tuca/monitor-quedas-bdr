@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v28", layout="wide", page_icon="🐢")
+st.set_page_config(page_title="Monitor BDR v29", layout="wide", page_icon="📉")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -28,7 +28,7 @@ if os.environ.get("GITHUB_ACTIONS") == "true":
     FILTRO_QUEDA = -0.01
     USAR_BOLLINGER = False
     USAR_FIBO = False
-    USAR_DONCHIAN = False # Padrão do robô
+    USAR_DONCHIAN = False
 else:
     MODO_ROBO = False
 
@@ -37,12 +37,12 @@ WHATSAPP_PHONE = get_secret('WHATSAPP_PHONE')
 WHATSAPP_APIKEY = get_secret('WHATSAPP_APIKEY')
 BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 
-PERIODO_HISTORICO_DIAS = "250d" # Necessário histórico longo para cálculo semanal
+PERIODO_HISTORICO_DIAS = "250d"
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
 # --- SIDEBAR ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel v28")
+    st.sidebar.title("🎛️ Painel v29")
     st.sidebar.markdown("---")
     
     st.sidebar.header("1. Day/Swing Trade (Quedas)")
@@ -52,8 +52,9 @@ if not MODO_ROBO:
     st.sidebar.markdown("---")
     st.sidebar.header("2. Estratégias de Tendência")
     fibo_visual = st.sidebar.checkbox("💎 Fibo Golden Zone", value=False)
-    # NOVA ESTRATÉGIA AQUI
-    donchian_visual = st.sidebar.checkbox("🐢 Donchian 10 (Semanal)", value=False, help="Rompimento de máxima de 10 semanas (Position Trade).")
+    donchian_visual = st.sidebar.checkbox("🐢 Donchian 10 (Semanal)", value=False)
+    
+    st.sidebar.info("Ordenação: Sempre pela Maior Queda")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
@@ -89,11 +90,11 @@ def buscar_dados(tickers):
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
-# --- LÓGICA V23 (Abertura vs Atual) ---
+# Resumo Simples
 def obter_resumo_simples(p_open, p_atual):
     return f"Abertura: {p_open:.2f} ➡ Atual: {p_atual:.2f}"
 
-# --- ESTRATÉGIA 1: FIBO ---
+# ESTRATÉGIA 1: FIBO
 def verificar_padrao_fibo(df_asset):
     try:
         if len(df_asset) < 70: return None
@@ -115,30 +116,19 @@ def verificar_padrao_fibo(df_asset):
         return None
     except: return None
 
-# --- ESTRATÉGIA 2: DONCHIAN 10 (NOVO) ---
+# ESTRATÉGIA 2: DONCHIAN 10
 def verificar_donchian_semanal(df_daily):
     try:
-        # Reamostra para Semanal (Sexta-feira como fim)
         df_w = df_daily.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         })
-        
-        # Precisa de histórico suficiente (10 semanas + atual)
         if len(df_w) < 12: return None
-        
-        # Donchian High: Máxima das 10 semanas ANTERIORES (shift 1)
         donchian_high = df_w['High'].rolling(10).max().shift(1)
-        
-        # Dados Atuais
-        preco_atual = df_w['Close'].iloc[-1] # Preço de agora
+        preco_atual = df_w['Close'].iloc[-1]
         banda_superior = donchian_high.iloc[-1]
-        
         if pd.isna(banda_superior): return None
-        
-        # Sinal: Rompimento da Banda Superior
         if preco_atual > banda_superior:
             return f"Rompimento Semanal (Preço: {preco_atual:.2f} > Banda: {banda_superior:.2f})"
-            
         return None
     except: return None
 
@@ -192,20 +182,20 @@ def enviar_whatsapp(msg):
         requests.get(url_whatsapp, headers=headers, timeout=25)
     except: pass
 
-# --- UI VISUAL (IGUAL V23) ---
+# --- UI VISUAL ---
 fuso = pytz.timezone('America/Sao_Paulo')
 hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
 
 if not MODO_ROBO:
     col_a, col_b = st.columns([3, 1])
-    col_a.title("📉 Monitor BDR v28")
+    col_a.title("📉 Monitor BDR v29")
     col_b.metric("🕒 Hora Brasília", hora_atual)
     
     with st.expander("ℹ️ Detalhes das Estratégias"):
         st.markdown("""
-        * **Day/Swing (Queda):** Busca ativos sobrevendidos no gráfico diário.
-        * **Fibo Golden Zone:** Busca ativos em tendência de alta corrigindo (Diário).
-        * **Donchian 10 (Novo):** Busca ativos rompendo a máxima de 10 semanas (Position Trade).
+        * **Day/Swing (Queda):** Busca ativos sobrevendidos.
+        * **Fibo Golden Zone:** Busca ativos em tendência de alta corrigindo.
+        * **Donchian 10:** Busca rompimento de máxima semanal (Position).
         """)
 
 # --- EXECUÇÃO ---
@@ -247,8 +237,7 @@ if start_btn:
                     low = last.get(('Low', t), np.nan)
                     banda = last.get(('BandaInf', t), np.nan)
                     
-                    # --- CHECAGEM DE ESTRATÉGIAS ---
-                    
+                    # CHECAGEM DE ESTRATÉGIAS
                     sinal_fibo = None
                     if USAR_FIBO:
                         try:
@@ -264,7 +253,6 @@ if start_btn:
                         except: pass
                     
                     passou_queda = False
-                    # Se nenhuma estratégia especial ativa, usa Queda
                     if not USAR_FIBO and not USAR_DONCHIAN:
                         passou_queda = True
                         if USAR_BOLLINGER and (pd.isna(low) or low >= banda): passou_queda = False
@@ -278,11 +266,11 @@ if start_btn:
                     
                     if not incluir: continue
                     
-                    # DEFINIR CLASSIFICAÇÃO
+                    # CLASSIFICAÇÃO
                     if sinal_donchian:
                         classif = "🐢 DONCHIAN"
                         motivo = sinal_donchian
-                        score = 6 # Prioridade Máxima
+                        score = 6
                     elif sinal_fibo:
                         classif = "💎 FIBO"
                         motivo = sinal_fibo
@@ -305,14 +293,14 @@ if start_btn:
                 except: continue
 
             if resultados:
-                # Ordenação: Score (Estratégias) -> Queda
-                resultados.sort(key=lambda x: (-x['Score'], x['Variação Total']))
+                # ORDENAÇÃO CORRIGIDA: SEMPRE PELA MAIOR QUEDA (Variação Total)
+                # Mesmo que seja um sinal Donchian, se a queda for grande, vai pro topo
+                resultados.sort(key=lambda x: x['Variação Total'])
                 
                 if not MODO_ROBO:
                     st.success(f"{len(resultados)} oportunidades.")
                     df_show = pd.DataFrame(resultados)
                     
-                    # Formatação
                     df_show['Variação Total'] = df_show['Variação Total'].apply(lambda x: f"{x:.2%}")
                     df_show['Gap Abertura'] = df_show['Gap Abertura'].apply(lambda x: f"{x:.2%}")
                     df_show['Força Intraday'] = df_show['Força Intraday'].apply(lambda x: f"{x:.2%}")
@@ -333,13 +321,14 @@ if start_btn:
                     if st.checkbox("Enviar WhatsApp Manual?"):
                         msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Classificação']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']:.2%} | {item['Classificação']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
                 if MODO_ROBO:
                     print(f"Encontradas {len(resultados)} oportunidades.")
                     msg = f"🚨 *Top Quedas* ({hora_atual})\n\n"
+                    # WhatsApp Limpo (Ticker + Queda + Classificação)
                     for item in resultados[:10]:
                         icone = "🐢" if "DONCHIAN" in item['Classificação'] else ("💎" if "FIBO" in item['Classificação'] else "🔻")
                         queda_txt = f"{item['Variação Total']:.2%}"
