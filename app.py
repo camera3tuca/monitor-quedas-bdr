@@ -9,7 +9,7 @@ import pytz
 import warnings
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Monitor BDR v23", layout="wide", page_icon="📉")
+st.set_page_config(page_title="Monitor BDR v28", layout="wide", page_icon="🐢")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- FUNÇÃO DE SEGREDOS ---
@@ -28,6 +28,7 @@ if os.environ.get("GITHUB_ACTIONS") == "true":
     FILTRO_QUEDA = -0.01
     USAR_BOLLINGER = False
     USAR_FIBO = False
+    USAR_DONCHIAN = False # Padrão do robô
 else:
     MODO_ROBO = False
 
@@ -36,24 +37,28 @@ WHATSAPP_PHONE = get_secret('WHATSAPP_PHONE')
 WHATSAPP_APIKEY = get_secret('WHATSAPP_APIKEY')
 BRAPI_API_TOKEN = get_secret('BRAPI_API_TOKEN')
 
-PERIODO_HISTORICO_DIAS = "250d"
+PERIODO_HISTORICO_DIAS = "250d" # Necessário histórico longo para cálculo semanal
 TERMINACOES_BDR = ('31', '32', '33', '34', '35', '39')
 
 # --- SIDEBAR ---
 if not MODO_ROBO:
-    st.sidebar.title("🎛️ Painel v23")
+    st.sidebar.title("🎛️ Painel v28")
     st.sidebar.markdown("---")
     
-    st.sidebar.header("Filtros")
+    st.sidebar.header("1. Day/Swing Trade (Quedas)")
     filtro_visual = st.sidebar.slider("Mínimo de Queda Total (%)", -15, 0, -3, 1) / 100
     bollinger_visual = st.sidebar.checkbox("Abaixo da Banda de Bollinger?", value=True)
-    fibo_visual = st.sidebar.checkbox("💎 Fibo Golden Zone", value=False)
     
-    st.sidebar.info("Ordenação: Maiores Quedas Primeiro")
+    st.sidebar.markdown("---")
+    st.sidebar.header("2. Estratégias de Tendência")
+    fibo_visual = st.sidebar.checkbox("💎 Fibo Golden Zone", value=False)
+    # NOVA ESTRATÉGIA AQUI
+    donchian_visual = st.sidebar.checkbox("🐢 Donchian 10 (Semanal)", value=False, help="Rompimento de máxima de 10 semanas (Position Trade).")
     
     FILTRO_QUEDA = filtro_visual
     USAR_BOLLINGER = bollinger_visual
     USAR_FIBO = fibo_visual
+    USAR_DONCHIAN = donchian_visual
 
 # --- FUNÇÕES ---
 
@@ -84,32 +89,56 @@ def buscar_dados(tickers):
         return df.dropna(axis=1, how='all')
     except: return pd.DataFrame()
 
-# FIBO
+# --- LÓGICA V23 (Abertura vs Atual) ---
+def obter_resumo_simples(p_open, p_atual):
+    return f"Abertura: {p_open:.2f} ➡ Atual: {p_atual:.2f}"
+
+# --- ESTRATÉGIA 1: FIBO ---
 def verificar_padrao_fibo(df_asset):
     try:
         if len(df_asset) < 70: return None
         close = df_asset['Close']; high = df_asset['High']; low = df_asset['Low']
-        
-        # Tendencia
         ema_trend = close.ewm(span=50).mean()
         if close.iloc[-1] < ema_trend.iloc[-1]: return None
-        
         recorte_topo = high.tail(20)
         topo_val = recorte_topo.max(); topo_idx = recorte_topo.idxmax()
-        
         df_antes = df_asset.loc[:topo_idx].iloc[:-1]
         if len(df_antes) < 60: return None
         fundo_val = df_antes['Low'].tail(60).min()
-        
         diff = topo_val - fundo_val
         if diff <= 0 or (diff/fundo_val) < 0.08: return None
-        
         fibo_618 = topo_val - (diff * 0.618)
         fibo_500 = topo_val - (diff * 0.500)
-        
         low_hj = low.iloc[-1]
         if low_hj <= fibo_500*1.01 and low_hj >= fibo_618*0.99:
             return f"Golden Zone"
+        return None
+    except: return None
+
+# --- ESTRATÉGIA 2: DONCHIAN 10 (NOVO) ---
+def verificar_donchian_semanal(df_daily):
+    try:
+        # Reamostra para Semanal (Sexta-feira como fim)
+        df_w = df_daily.resample('W-FRI').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        })
+        
+        # Precisa de histórico suficiente (10 semanas + atual)
+        if len(df_w) < 12: return None
+        
+        # Donchian High: Máxima das 10 semanas ANTERIORES (shift 1)
+        donchian_high = df_w['High'].rolling(10).max().shift(1)
+        
+        # Dados Atuais
+        preco_atual = df_w['Close'].iloc[-1] # Preço de agora
+        banda_superior = donchian_high.iloc[-1]
+        
+        if pd.isna(banda_superior): return None
+        
+        # Sinal: Rompimento da Banda Superior
+        if preco_atual > banda_superior:
+            return f"Rompimento Semanal (Preço: {preco_atual:.2f} > Banda: {banda_superior:.2f})"
+            
         return None
     except: return None
 
@@ -154,34 +183,35 @@ def analisar_sinal_classico(row, t):
     except: return "Erro", "-", 0
 
 def enviar_whatsapp(msg):
+    print("--- TENTANDO ENVIAR WHATSAPP ---")
     if not WHATSAPP_PHONE or not WHATSAPP_APIKEY: return
     try:
         texto_codificado = requests.utils.quote(msg)
         url_whatsapp = f"https://api.callmebot.com/whatsapp.php?phone={WHATSAPP_PHONE}&text={texto_codificado}&apikey={WHATSAPP_APIKEY}"
         headers = { "User-Agent": "Mozilla/5.0" }
-        requests.get(url_whatsapp, headers=headers, timeout=20)
+        requests.get(url_whatsapp, headers=headers, timeout=25)
     except: pass
 
-# --- UI VISUAL ---
+# --- UI VISUAL (IGUAL V23) ---
 fuso = pytz.timezone('America/Sao_Paulo')
 hora_atual = dt.datetime.now(fuso).strftime("%H:%M")
 
 if not MODO_ROBO:
     col_a, col_b = st.columns([3, 1])
-    col_a.title("📉 Monitor BDR v23")
+    col_a.title("📉 Monitor BDR v28")
     col_b.metric("🕒 Hora Brasília", hora_atual)
     
-    with st.expander("ℹ️ Como ler o Gap e Recuperação?"):
+    with st.expander("ℹ️ Detalhes das Estratégias"):
         st.markdown("""
-        * **GAP (Abertura):** Diferença entre o fechamento de ontem e a abertura de hoje.
-        * **Intraday (Força):** Variação desde a abertura de hoje até agora.
-        * **Ordenação:** A tabela mostra primeiro as **Maiores Quedas** do dia.
+        * **Day/Swing (Queda):** Busca ativos sobrevendidos no gráfico diário.
+        * **Fibo Golden Zone:** Busca ativos em tendência de alta corrigindo (Diário).
+        * **Donchian 10 (Novo):** Busca ativos rompendo a máxima de 10 semanas (Position Trade).
         """)
 
 # --- EXECUÇÃO ---
-botao_analisar = st.button("🔄 Rodar Análise Agora", type="primary") if not MODO_ROBO else True
+start_btn = True if MODO_ROBO else st.button("🔄 Rodar Análise Agora", type="primary")
 
-if botao_analisar:
+if start_btn:
     lista_bdrs, mapa_nomes = obter_dados_brapi()
     
     if not MODO_ROBO and lista_bdrs:
@@ -201,12 +231,11 @@ if botao_analisar:
                     p_atual = last[('Close', t)]
                     p_open = last[('Open', t)]
                     
-                    # Cálculo Matemático do GAP e Intraday
+                    # Gap e Intraday
                     p_ontem = p_atual / (1 + var_total)
                     gap_pct = (p_open / p_ontem) - 1
                     intraday_pct = (p_atual / p_open) - 1
                     
-                    # Definição do STATUS
                     status_movimento = "Neutro"
                     if gap_pct < -0.005:
                         if intraday_pct > 0.002: status_movimento = "♻️ Recuperando"
@@ -215,9 +244,10 @@ if botao_analisar:
                     elif intraday_pct < -0.01:
                          status_movimento = "🔻 Queda Intraday"
 
-                    # FILTROS
                     low = last.get(('Low', t), np.nan)
                     banda = last.get(('BandaInf', t), np.nan)
+                    
+                    # --- CHECAGEM DE ESTRATÉGIAS ---
                     
                     sinal_fibo = None
                     if USAR_FIBO:
@@ -226,16 +256,34 @@ if botao_analisar:
                             sinal_fibo = verificar_padrao_fibo(df_ticker)
                         except: pass
                     
+                    sinal_donchian = None
+                    if USAR_DONCHIAN:
+                        try:
+                            df_ticker = df.xs(t, axis=1, level=1).dropna()
+                            sinal_donchian = verificar_donchian_semanal(df_ticker)
+                        except: pass
+                    
                     passou_queda = False
-                    if not USAR_FIBO:
+                    # Se nenhuma estratégia especial ativa, usa Queda
+                    if not USAR_FIBO and not USAR_DONCHIAN:
                         passou_queda = True
                         if USAR_BOLLINGER and (pd.isna(low) or low >= banda): passou_queda = False
                         if pd.isna(var_total) or var_total > FILTRO_QUEDA: passou_queda = False
                     
-                    if USAR_FIBO and not sinal_fibo: continue
-                    if not USAR_FIBO and not passou_queda: continue
+                    # LOGICA DE INCLUSÃO
+                    incluir = False
+                    if USAR_FIBO and sinal_fibo: incluir = True
+                    if USAR_DONCHIAN and sinal_donchian: incluir = True
+                    if not USAR_FIBO and not USAR_DONCHIAN and passou_queda: incluir = True
                     
-                    if sinal_fibo:
+                    if not incluir: continue
+                    
+                    # DEFINIR CLASSIFICAÇÃO
+                    if sinal_donchian:
+                        classif = "🐢 DONCHIAN"
+                        motivo = sinal_donchian
+                        score = 6 # Prioridade Máxima
+                    elif sinal_fibo:
                         classif = "💎 FIBO"
                         motivo = sinal_fibo
                         score = 5
@@ -244,37 +292,27 @@ if botao_analisar:
                     
                     nome_completo = mapa_nomes.get(t, t)
                     primeiro_nome = nome_completo.split()[0] if nome_completo else t
-                    
-                    # RESUMO SIMPLES (Garantido de funcionar)
-                    # Mostra Abertura vs Atual (já temos esses dados, não precisa baixar nada novo)
-                    resumo_simples = f"Abertura: {p_open:.2f} ➡ Atual: {p_atual:.2f}"
+                    resumo_simples = obter_resumo_simples(p_open, p_atual)
 
                     resultados.append({
-                        'Ticker': t, 
-                        'Empresa': primeiro_nome,
-                        'Variação Total': var_total, 
-                        'Gap Abertura': gap_pct,
-                        'Força Intraday': intraday_pct,
-                        'Preço': p_atual,
-                        'IFR14': last[('IFR14', t)], 
-                        'Classificação': classif,
-                        'Status': status_movimento,
-                        'Motivo': motivo, 
-                        'Score': score,
-                        'Evolução': resumo_simples # Coluna nova garantida
+                        'Ticker': t, 'Empresa': primeiro_nome,
+                        'Variação Total': var_total, 'Gap Abertura': gap_pct,
+                        'Força Intraday': intraday_pct, 'Preço': p_atual,
+                        'IFR14': last[('IFR14', t)], 'Classificação': classif,
+                        'Status': status_movimento, 'Motivo': motivo, 
+                        'Score': score, 'Evolução': resumo_simples
                     })
                 except: continue
 
             if resultados:
-                # ORDENAÇÃO: MAIOR QUEDA PRIMEIRO
-                resultados.sort(key=lambda x: x['Variação Total'])
+                # Ordenação: Score (Estratégias) -> Queda
+                resultados.sort(key=lambda x: (-x['Score'], x['Variação Total']))
                 
                 if not MODO_ROBO:
-                    st.success(f"{len(resultados)} oportunidades encontradas.")
-                    
+                    st.success(f"{len(resultados)} oportunidades.")
                     df_show = pd.DataFrame(resultados)
                     
-                    # FORMATAÇÃO VISUAL
+                    # Formatação
                     df_show['Variação Total'] = df_show['Variação Total'].apply(lambda x: f"{x:.2%}")
                     df_show['Gap Abertura'] = df_show['Gap Abertura'].apply(lambda x: f"{x:.2%}")
                     df_show['Força Intraday'] = df_show['Força Intraday'].apply(lambda x: f"{x:.2%}")
@@ -282,33 +320,31 @@ if botao_analisar:
                     df_show['IFR14'] = df_show['IFR14'].apply(lambda x: f"{x:.1f}")
                     
                     st.dataframe(
-                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'IFR14', 'Classificação', 'Evolução']], 
-                        use_container_width=True,
-                        hide_index=True,
+                        df_show[['Ticker', 'Empresa', 'Variação Total', 'Gap Abertura', 'Força Intraday', 'Status', 'Preço', 'IFR14', 'Classificação', 'Evolução']], 
+                        use_container_width=True, hide_index=True,
                         column_config={
                             "Variação Total": st.column_config.TextColumn("Total", width="small"),
                             "Gap Abertura": st.column_config.TextColumn("Gap", width="small"),
-                            "Força Intraday": st.column_config.TextColumn("Intraday", width="small"),
                             "Status": st.column_config.TextColumn("Diagnóstico", width="medium"),
-                            "Evolução": st.column_config.TextColumn("Evolução do Dia (R$)", width="medium"),
+                            "Evolução": st.column_config.TextColumn("Abertura ➡ Atual", width="medium"),
                         }
                     )
                     
                     if st.checkbox("Enviar WhatsApp Manual?"):
                         msg = f"🚨 *Manual* ({hora_atual})\n\n"
                         for item in resultados[:10]:
-                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Status']}\n"
+                            msg += f"-> *{item['Ticker']}*: {item['Variação Total']} | {item['Classificação']}\n"
                         enviar_whatsapp(msg)
                         st.success("Enviado!")
 
                 if MODO_ROBO:
                     print(f"Encontradas {len(resultados)} oportunidades.")
-                    msg = f"🚨 *Top 10* ({hora_atual})\n\n"
-                    # Como já ordenamos pela maior queda, o [:10] vai pegar as 10 piores
+                    msg = f"🚨 *Top Quedas* ({hora_atual})\n\n"
                     for item in resultados[:10]:
-                        icone = "💎" if "FIBO" in item['Classificação'] else "🔻"
-                        msg += f"{icone} *{item['Ticker']}* ({item['Empresa']}): {item['Variação Total']:.2%} | {item['Status']}\n"
-                    msg += f"\nSite: share.streamlit.io"
+                        icone = "🐢" if "DONCHIAN" in item['Classificação'] else ("💎" if "FIBO" in item['Classificação'] else "🔻")
+                        queda_txt = f"{item['Variação Total']:.2%}"
+                        msg += f"{icone} *{item['Ticker']}*: {queda_txt} | {item['Classificação']}\n"
+                    msg += f"\nDetalhes: share.streamlit.io"
                     enviar_whatsapp(msg)
             else:
                 if MODO_ROBO: print("Sem oportunidades.")
